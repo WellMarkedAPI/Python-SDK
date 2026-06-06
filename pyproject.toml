@@ -47,15 +47,15 @@ dev = [
 [project.urls]
 Homepage = "https://wellmarked.io"
 Documentation = "https://wellmarked.io/docs"
-Source = "https://github.com/WellMarkedAPI/WellMarked/tree/master/python-sdk"
-Issues = "https://github.com/WellMarkedAPI/WellMarked/issues"
+Source = "https://github.com/WellMarkedAPI/Python-SDK/tree/master"
+Issues = "https://github.com/WellMarkedAPI/Python-SDK/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/wellmarked"]
+packages = ["wellmarked"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/wellmarked",
+    "wellmarked",
     "README.md",
     "LICENSE",
     "pyproject.toml",
@@ -68,7 +68,7 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.9"
 strict = true
-files = ["src/wellmarked"]
+files = ["wellmarked"]
 
 [tool.ruff]
 line-length = 100
