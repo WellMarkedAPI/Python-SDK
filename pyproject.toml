@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wellmarked"
+version = "1.1.1"
+description = "Official Python SDK for the WellMarked API — convert any URL to clean Markdown."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [
+    { name = "WellMarked", email = "support@wellmarked.io" },
+]
+keywords = ["wellmarked", "markdown", "scraping", "extraction", "html-to-markdown", "rag", "llm", "pipeline"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.25,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "respx>=0.20",
+    "mypy>=1.8",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://wellmarked.io"
+Documentation = "https://wellmarked.io/docs"
+Source = "https://github.com/WellMarkedAPI/WellMarked/tree/master/python-sdk"
+Issues = "https://github.com/WellMarkedAPI/WellMarked/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wellmarked"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/wellmarked",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+files = ["src/wellmarked"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
