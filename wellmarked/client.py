@@ -243,7 +243,8 @@ class WellMarked:
 
         Plan caps:
             * Free → ``PermissionDeniedError`` (``plan_not_supported``)
-            * Pro → max depth 5, up to 1,000 pages per crawl
+            * Pro → max depth 5, up to 2,000 pages per crawl
+            * Growth → max depth 10, up to 10,000 pages per crawl
             * Enterprise → unlimited depth and pages
 
         See :meth:`bulk` for the meaning of ``webhook_url`` and

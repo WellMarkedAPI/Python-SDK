@@ -39,7 +39,7 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Any, Mapping
+from typing import Any, List, Literal, Mapping, Optional, TypedDict, cast
 
 
 _DEFAULT_MAX_AGE_SEC = 300
@@ -56,13 +56,42 @@ class WebhookVerificationError(Exception):
     """
 
 
+class _WebhookPayloadBase(TypedDict):
+    """Fields present on every ``job.completed`` delivery."""
+
+    event: Literal["job.completed"]
+    job_id: str
+    kind: Literal["bulk", "crawl"]
+    status: Literal["done"]
+    total: int
+    completed: int
+    finished_at: str
+    results_url: str
+
+
+class WebhookPayload(_WebhookPayloadBase, total=False):
+    """The validated ``job.completed`` payload returned by :func:`verify_webhook`.
+
+    The keys below the required set are crawl-only (``truncated``,
+    ``truncated_reason``) or only present when ``webhook_include_results``
+    was set on the originating :meth:`bulk` / :meth:`crawl` call
+    (``results``, ``results_truncated_for_size``). Check ``kind`` before
+    reading the crawl-only fields. Mirrors the JS SDK's ``WebhookPayload``.
+    """
+
+    truncated: Optional[bool]
+    truncated_reason: Optional[str]
+    results: List[Any]
+    results_truncated_for_size: bool
+
+
 def verify_webhook(
     *,
     secret: str,
     headers: Mapping[str, str],
     body: bytes,
     max_age_sec: int = _DEFAULT_MAX_AGE_SEC,
-) -> dict[str, Any]:
+) -> "WebhookPayload":
     """Verify a WellMarked webhook delivery. Returns the parsed payload.
 
     Args:
@@ -81,7 +110,9 @@ def verify_webhook(
             skew greater than 5 minutes against UTC.
 
     Returns:
-        The parsed JSON payload (the same dict WellMarked sent).
+        The validated ``job.completed`` payload — a :class:`WebhookPayload`
+        (a plain ``dict`` at runtime, typed for editor support to mirror
+        the JS SDK).
 
     Raises:
         WebhookVerificationError: signature mismatch, stale timestamp,
@@ -167,6 +198,6 @@ def verify_webhook(
         raise WebhookVerificationError("Webhook signature mismatch.")
 
     try:
-        return json.loads(body)
+        return cast("WebhookPayload", json.loads(body))
     except (ValueError, TypeError) as e:
         raise WebhookVerificationError(f"Webhook body is not valid JSON: {e}")

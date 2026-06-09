@@ -33,7 +33,7 @@ from .models import (
     RotatedWebhookSecret,
     Usage,
 )
-from .webhooks import WebhookVerificationError, verify_webhook
+from .webhooks import WebhookPayload, WebhookVerificationError, verify_webhook
 
 __all__ = [
     "__version__",
@@ -63,4 +63,5 @@ __all__ = [
     # Webhooks
     "verify_webhook",
     "WebhookVerificationError",
+    "WebhookPayload",
 ]

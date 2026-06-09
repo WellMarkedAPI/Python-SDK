@@ -47,7 +47,7 @@ dev = [
 [project.urls]
 Homepage = "https://wellmarked.io"
 Documentation = "https://wellmarked.io/docs"
-Source = "https://github.com/WellMarkedAPI/Python-SDK/tree/master"
+Source = "https://github.com/WellMarkedAPI/Python-SDK"
 Issues = "https://github.com/WellMarkedAPI/Python-SDK/issues"
 
 [tool.hatch.build.targets.wheel]
