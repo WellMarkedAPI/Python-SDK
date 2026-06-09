@@ -10,7 +10,6 @@ import httpx
 from ._base import (
     DEFAULT_BASE_URL,
     DEFAULT_TIMEOUT,
-    default_headers,
     merge_headers,
     parse_response,
     resolve_api_key,
