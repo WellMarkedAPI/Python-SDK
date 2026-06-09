@@ -3,14 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional, Union, Any
 
 import httpx
 
 from ._base import (
     DEFAULT_BASE_URL,
     DEFAULT_TIMEOUT,
-    default_headers,
     merge_headers,
     parse_response,
     resolve_api_key,
@@ -192,7 +191,7 @@ class AsyncWellMarked:
 
     # ── Transport ─────────────────────────────────────────────────────────────
 
-    async def _request(self, method: str, path: str, *, json: object = None):
+    async def _request(self, method: str, path: str, *, json: object = None) -> Any:
         # See WellMarked._request for why we build absolute URLs ourselves.
         url = f"{self._base_url}{path}"
         try:
@@ -201,8 +200,9 @@ class AsyncWellMarked:
             raise wrap_transport_error(exc) from exc
 
         try:
-            body = response.json() if response.content else None
-        except ValueError:
+            assert response.content
+            body = response.json()
+        except (AssertionError, ValueError):
             body = None
 
         # httpx Headers is dict-like for our purposes; pass it through so
