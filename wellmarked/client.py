@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional, Union, Any
 
 import httpx
 
@@ -325,7 +325,7 @@ class WellMarked:
 
     # ── Transport ─────────────────────────────────────────────────────────────
 
-    def _request(self, method: str, path: str, *, json: object = None):
+    def _request(self, method: str, path: str, *, json: object = None) -> Any:
         # Build absolute URLs ourselves rather than relying on httpx's base_url
         # join. That way a user-supplied http_client without a base_url still
         # works — important when the caller wants a custom transport/proxy.
@@ -336,8 +336,9 @@ class WellMarked:
             raise wrap_transport_error(exc) from exc
 
         try:
-            body = response.json() if response.content else None
-        except ValueError:
+            assert response.content
+            body = response.json()
+        except (AssertionError, ValueError):
             body = None
 
         # httpx Headers is dict-like for our purposes; pass it through so
