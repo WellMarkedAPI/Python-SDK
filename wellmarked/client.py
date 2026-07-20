@@ -8,13 +8,23 @@ import httpx
 
 from ._base import (
     DEFAULT_BASE_URL,
+    DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
+    backoff_seconds,
+    is_safe_to_replay,
     merge_headers,
+    new_idempotency_key,
     parse_response,
+    policy_overrides,
     resolve_api_key,
+    sanitize_headers,
     wrap_transport_error,
 )
-from .models import BulkJob, CrawlJob, ExtractResult, RotatedKey, RotatedWebhookSecret, Usage
+from .models import (
+    ApiKeyInfo, BulkJob, CrawlJob, CreatedKey, ExtractResult, LogsPage,
+    RegisteredAccount, RevokedKey, RotatedKey, RotatedWebhookSecret,
+    SearchResults, Usage,
+)
 
 
 class WellMarked:
@@ -40,6 +50,7 @@ class WellMarked:
         *,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: Optional[httpx.Client] = None,
         headers: Optional[dict[str, str]] = None,
     ) -> None:
@@ -49,7 +60,20 @@ class WellMarked:
             api_key: Your WellMarked API key (``wm_...``). Falls back to the
                 ``WELLMARKED_API_KEY`` environment variable.
             base_url: API base URL. Override for testing.
-            timeout: Per-request timeout, seconds.
+            timeout: Timeout for a single attempt, seconds. This is **per
+                attempt, not per call**: with the default ``max_retries=2`` a
+                retryable request can take up to roughly ``timeout * 3`` plus
+                backoff (~92s at the defaults) before giving up. Lower
+                ``max_retries`` if you need a tighter ceiling.
+            max_retries: How many times to retry a request the SDK knows is
+                safe to replay. Defaults to 2 (3 attempts total); 0 disables.
+                Only connection failures and 5xx are retried, and only for
+                GETs and POSTs carrying an ``Idempotency-Key`` (which
+                :meth:`bulk` and :meth:`crawl` send automatically). A
+                ``POST /extract`` is never retried — the API bills it on
+                arrival, and a connection error can't tell you whether it
+                arrived. Retries reuse the same key, so the API replays the
+                original job rather than enqueuing a second one.
             http_client: Bring your own ``httpx.Client`` (custom transport,
                 proxy, shared pool). The SDK won't close it on ``__exit__``
                 when you pass one.
@@ -60,6 +84,7 @@ class WellMarked:
         """
         self._api_key = resolve_api_key(api_key)
         self._base_url = base_url.rstrip("/")
+        self._max_retries = max(0, max_retries)
         self._extra_headers: dict[str, str] = dict(headers or {})
         merged = merge_headers(self._api_key, self._extra_headers)
         self._owns_client = http_client is None
@@ -73,6 +98,58 @@ class WellMarked:
         # headers they may have set deliberately.
         if not self._owns_client:
             self._client.headers.update(merged)
+
+    # ── Self-registration ─────────────────────────────────────────────────────
+
+    @classmethod
+    def register(
+        cls,
+        email: str,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float = DEFAULT_TIMEOUT,
+        http_client: Optional[httpx.Client] = None,
+    ) -> RegisteredAccount:
+        """Self-register for a free, extract-only API key — no existing key needed.
+
+        The zero-to-first-call path for an agent that discovered WellMarked
+        programmatically. Returns a :class:`RegisteredAccount` whose ``api_key``
+        is a weak credential (Free plan, ``scopes=["extract"]``); build a client
+        with it::
+
+            account = WellMarked.register("agent@example.com")
+            with WellMarked(api_key=account.api_key) as wm:
+                wm.extract("https://example.com")
+
+        Not retried — registration mints an account and isn't idempotent.
+
+        Raises:
+            RateLimitError: ``register_rate_limited`` — too many registrations
+                from this IP.
+            APIStatusError: ``email_taken`` (409) if the email already has an
+                account; ``service_unavailable`` (503) if the limiter backend is
+                momentarily down (retry shortly).
+        """
+        url = f"{base_url.rstrip('/')}/register"
+        owns = http_client is None
+        client = http_client or httpx.Client(timeout=timeout)
+        try:
+            try:
+                response = client.post(url, json={"email": email})
+            except httpx.HTTPError as exc:
+                raise wrap_transport_error(exc)
+            try:
+                assert response.content
+                body = response.json()
+            except (AssertionError, ValueError):
+                body = None
+            data = parse_response(
+                response.status_code, body, headers=dict(response.headers),
+            )
+        finally:
+            if owns:
+                client.close()
+        return RegisteredAccount.from_response(data)
 
     # ── Context manager ───────────────────────────────────────────────────────
 
@@ -93,25 +170,74 @@ class WellMarked:
 
     # ── Endpoints ─────────────────────────────────────────────────────────────
 
-    def extract(self, url: str, *, render_js: bool = False) -> ExtractResult:
+    def extract(
+        self,
+        url: str,
+        *,
+        render_js: bool = False,
+        allow_domains: Optional[Iterable[str]] = None,
+        deny_patterns: Optional[Iterable[str]] = None,
+        respect_robots: Optional[str] = None,
+    ) -> ExtractResult:
         """Extract clean Markdown from a single URL.
 
         Args:
             url: The URL to extract content from.
             render_js: Use Playwright to render JS-heavy pages. Requires a
-                Pro/Enterprise plan AND ``ENABLE_JS_RENDERING=true`` on the
-                API instance.
+                Pro, Growth, or Enterprise plan; Free returns
+                ``plan_not_supported``.
+            allow_domains: Restrict this request to these domains (and their
+                subdomains). Can only narrow your key's own allowlist, never
+                widen it.
+            deny_patterns: Extra deny globs for this request (matched against
+                the hostname and full URL). Added to your key's deny list.
+            respect_robots: ``"strict"`` or ``"lax"``. Can upgrade your key's
+                setting to ``"strict"`` for this request but never relax it.
 
         Raises:
             RateLimitError: Monthly plan limit reached.
-            UnprocessableEntityError: ``no_content``, ``target_timeout``, or
-                ``js_rendering_disabled``.
+            PermissionDeniedError: ``plan_not_supported`` (``render_js=True`` on
+                Free), or a policy denial — ``domain_not_allowed``,
+                ``domain_denied``, ``robots_disallowed``.
+            UnprocessableEntityError: ``no_content`` or ``target_timeout``.
             AuthenticationError: Missing or invalid API key.
         """
-        body = self._request(
-            "POST", "/extract", json={"url": url, "render_js": render_js}
-        )
+        payload: dict[str, object] = {"url": url, "render_js": render_js}
+        payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
+        body = self._request("POST", "/extract", json=payload)
         return ExtractResult.from_response(body)
+
+    def search(
+        self,
+        query: str,
+        *,
+        num_results: int = 5,
+        render_js: bool = False,
+    ) -> SearchResults:
+        """Search the web and extract each result to Markdown. Synchronous.
+
+        One round trip: the query runs against the search provider and the
+        result pages are extracted concurrently, returned together with per-page
+        ``status`` (a slow or blocked page becomes an error item, never sinks the
+        call). Costs ``1 + len(results)`` requests — one for the query, one per
+        page returned.
+
+        Args:
+            query: The search query.
+            num_results: How many results to fetch + extract. Clamped to 1..10
+                server-side (a search is one synchronous call, so it's capped).
+            render_js: Use Playwright to render JS-heavy result pages.
+
+        Raises:
+            PermissionDeniedError: ``plan_not_supported`` — search requires a
+                Pro, Growth, or Enterprise plan.
+            RateLimitError: This search would exceed your remaining monthly quota.
+            InternalServerError: The search provider is unconfigured or
+                unreachable — ``.code == "service_unavailable"`` (retryable).
+        """
+        payload = {"query": query, "num_results": num_results, "render_js": render_js}
+        body = self._request("POST", "/search", json=payload)
+        return SearchResults.from_response(body)
 
     def bulk(
         self,
@@ -120,12 +246,20 @@ class WellMarked:
         render_js: bool = False,
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
+        idempotency_key: Optional[str] = None,
+        allow_domains: Optional[Iterable[str]] = None,
+        deny_patterns: Optional[Iterable[str]] = None,
+        respect_robots: Optional[str] = None,
     ) -> BulkJob:
         """Submit a batch of URLs for concurrent extraction.
 
         Returns immediately with ``status="queued"``. Poll with
         :meth:`get_job` or block with :meth:`wait_for_job` to collect results
         — OR pass ``webhook_url`` to skip polling entirely.
+
+        An ``Idempotency-Key`` is generated per call and reused across the
+        SDK's internal retries (see ``max_retries``), so a connection blip
+        replays the original job rather than enqueuing a second one.
 
         Args:
             urls: The URLs to extract from.
@@ -139,11 +273,28 @@ class WellMarked:
                 shape with ``results_truncated_for_size=true``). When
                 ``False`` (default), the payload carries only metadata
                 and a ``results_url`` pointing at :meth:`get_job`.
+            idempotency_key: Sent as the ``Idempotency-Key`` header.
+                Generated automatically when omitted, and reused across the
+                SDK's internal retries. **Pass your own to survive anything
+                the SDK can't retry for you** — a process crash, or your code
+                catching the error and calling ``bulk()`` again; that second
+                call mints a *new* key and gets a *second* job unless you
+                reuse a stable one. Same key + same body replays the original
+                job; same key + a different body raises
+                ``idempotency_key_reuse``. Records expire after 6 hours,
+                matching the job TTL. The body must match byte-for-byte —
+                reordering ``urls`` counts as a different request.
+            allow_domains, deny_patterns, respect_robots: Per-request
+                compliance overrides — see :meth:`extract`. Because bulk
+                enforces policy per URL, a denial surfaces as a **per-item
+                error** (in ``results[].error``), not a raised exception.
 
         Raises:
-            PermissionDeniedError: ``plan_not_supported`` (Free tier).
-            UnprocessableEntityError: ``bulk_cap_exceeded`` (50 on Pro,
-                200 on Growth) or ``webhook_url_invalid``.
+            PermissionDeniedError: ``plan_not_supported`` — ``render_js=True``
+                on the Free plan.
+            UnprocessableEntityError: ``bulk_cap_exceeded`` (5 on Free, 50 on
+                Pro, 200 on Growth), ``webhook_url_invalid``, or
+                ``idempotency_key_reuse``.
             RateLimitError: Submitting this batch would exceed your remaining
                 monthly quota.
         """
@@ -154,7 +305,11 @@ class WellMarked:
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
-        body = self._request("POST", "/bulk", json=payload)
+        payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
+        body = self._request(
+            "POST", "/bulk", json=payload,
+            headers={"Idempotency-Key": idempotency_key or new_idempotency_key()},
+        )
         return BulkJob.from_response(body)
 
     def get_job(self, job_id: str) -> Union[BulkJob, CrawlJob]:
@@ -232,6 +387,10 @@ class WellMarked:
         render_js: bool = False,
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
+        idempotency_key: Optional[str] = None,
+        allow_domains: Optional[Iterable[str]] = None,
+        deny_patterns: Optional[Iterable[str]] = None,
+        respect_robots: Optional[str] = None,
     ) -> CrawlJob:
         """Crawl a site starting from ``url``, BFS to ``depth``.
 
@@ -240,19 +399,26 @@ class WellMarked:
         handle crawl and bulk job_ids transparently. Pass ``webhook_url``
         to receive a signed POST when the job finishes instead of polling.
 
+        Retry-safe by default — see :meth:`bulk` for how ``idempotency_key``
+        behaves. It matters at least as much here: a crawl bills per page, so
+        an accidental second crawl of the same site bills every page twice.
+
         Plan caps:
             * Free → ``PermissionDeniedError`` (``plan_not_supported``)
             * Pro → max depth 5, up to 2,000 pages per crawl
             * Growth → max depth 10, up to 10,000 pages per crawl
             * Enterprise → unlimited depth and pages
 
-        See :meth:`bulk` for the meaning of ``webhook_url`` and
-        ``webhook_include_results``.
+        See :meth:`bulk` for the meaning of ``webhook_url``,
+        ``webhook_include_results``, and ``idempotency_key``. The compliance
+        overrides ``allow_domains`` / ``deny_patterns`` / ``respect_robots``
+        work as in :meth:`extract`; as with bulk, a per-page policy denial
+        surfaces in ``results[].error`` rather than raising.
 
         Raises:
             PermissionDeniedError: ``plan_not_supported`` (Free tier).
-            UnprocessableEntityError: ``crawl_depth_exceeded`` or
-                ``webhook_url_invalid``.
+            UnprocessableEntityError: ``crawl_depth_exceeded``,
+                ``webhook_url_invalid``, or ``idempotency_key_reuse``.
         """
         if depth < 0:
             raise ValueError("depth must be >= 0.")
@@ -262,7 +428,11 @@ class WellMarked:
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
-        body = self._request("POST", "/crawl", json=payload)
+        payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
+        body = self._request(
+            "POST", "/crawl", json=payload,
+            headers={"Idempotency-Key": idempotency_key or new_idempotency_key()},
+        )
         return CrawlJob.from_response(body)
 
     # ── Custom headers ────────────────────────────────────────────────────────
@@ -323,24 +493,107 @@ class WellMarked:
         body = self._request("POST", "/webhook/rotate")
         return RotatedWebhookSecret.from_response(body)
 
+    # ── Key management (scoped keys) ──────────────────────────────────────────
+
+    def create_key(self, scopes: Iterable[str], *, name: str = "default") -> CreatedKey:
+        """Mint a new scoped API key on this account.
+
+        Args:
+            scopes: A non-empty subset of ``extract``, ``bulk``, ``crawl``,
+                ``keys``. Your calling key can only grant scopes it holds.
+            name: A label for the key (shown in :meth:`list_keys`).
+
+        The raw key is in the returned ``api_key`` — store it, it's shown once.
+        Requires the ``keys`` scope. Doesn't count toward your quota.
+
+        Raises:
+            PermissionDeniedError: ``insufficient_scope`` — your key lacks
+                ``keys``, or you asked for a scope it doesn't hold.
+            UnprocessableEntityError: ``invalid_request`` — empty or unknown
+                scopes.
+        """
+        body = self._request(
+            "POST", "/keys", json={"scopes": list(scopes), "name": name},
+        )
+        return CreatedKey.from_response(body)
+
+    def list_keys(self) -> list[ApiKeyInfo]:
+        """List this account's keys (metadata only — never the raw values),
+        including revoked ones (``revoked_at`` set). Requires the ``keys``
+        scope. Doesn't count toward your quota."""
+        body = self._request("GET", "/keys")
+        return [ApiKeyInfo.from_dict(k) for k in (body.get("keys") or [])]
+
+    def revoke_key(self, key_id: str) -> RevokedKey:
+        """Revoke a key by id — it stops authenticating immediately. Idempotent.
+        Requires the ``keys`` scope. Doesn't count toward your quota.
+
+        Raises:
+            NotFoundError: ``key_not_found`` — no such key on this account.
+        """
+        body = self._request("DELETE", f"/keys/{key_id}")
+        return RevokedKey.from_response(body)
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+
+    def get_logs(self, *, limit: int = 50, offset: int = 0) -> LogsPage:
+        """Return this account's request history, newest first — the audit
+        trail (which key ran each call and how its policy decided). Own rows
+        only. Paginate via ``offset += limit`` while ``has_more`` is True.
+        Doesn't count toward your quota."""
+        body = self._request("GET", f"/logs?limit={int(limit)}&offset={int(offset)}")
+        return LogsPage.from_response(body)
+
     # ── Transport ─────────────────────────────────────────────────────────────
 
-    def _request(self, method: str, path: str, *, json: object = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: object = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Any:
         # Build absolute URLs ourselves rather than relying on httpx's base_url
         # join. That way a user-supplied http_client without a base_url still
         # works — important when the caller wants a custom transport/proxy.
         url = f"{self._base_url}{path}"
-        try:
-            response = self._client.request(method, url, json=json)
-        except httpx.HTTPError as exc:
-            raise wrap_transport_error(exc) from exc
+        extra = sanitize_headers(headers)
 
-        try:
-            assert response.content
-            body = response.json()
-        except (AssertionError, ValueError):
-            body = None
+        # Retries reuse `extra` unchanged, so every attempt carries the SAME
+        # Idempotency-Key and the API collapses them into one job. See
+        # _base.is_safe_to_replay for why POST /extract is excluded.
+        attempts = self._max_retries + 1 if is_safe_to_replay(method, extra) else 1
+        last_exc: Optional[Exception] = None
 
-        # httpx Headers is dict-like for our purposes; pass it through so
-        # parse_response can read Retry-After-Ms on rate-limit 429s.
-        return parse_response(response.status_code, body, headers=dict(response.headers))
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(backoff_seconds(attempt))
+            try:
+                # Per-request headers are passed to httpx, never written onto
+                # the shared client — see _base.sanitize_headers.
+                response = self._client.request(method, url, json=json, headers=extra)
+            except httpx.HTTPError as exc:
+                last_exc = wrap_transport_error(exc)
+                continue
+
+            # 5xx is the other ambiguous case: the API may have committed the
+            # job before failing. 4xx is deterministic — replaying reproduces
+            # it, so don't waste the caller's time.
+            if response.status_code >= 500 and attempt < attempts - 1:
+                continue
+
+            try:
+                assert response.content
+                body = response.json()
+            except (AssertionError, ValueError):
+                body = None
+
+            # httpx Headers is dict-like for our purposes; pass it through so
+            # parse_response can read Retry-After-Ms on rate-limit 429s.
+            return parse_response(
+                response.status_code, body, headers=dict(response.headers),
+            )
+
+        assert last_exc is not None  # only reachable via the except branch
+        raise last_exc

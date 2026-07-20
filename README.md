@@ -228,7 +228,7 @@ with WellMarked() as wm:
     except RateLimitError as e:
         print(f"Quota hit. Resets in {e.retry_after}s.")
     except UnprocessableEntityError as e:
-        # e.code is one of: no_content, target_timeout, js_rendering_disabled, ...
+        # e.code is one of: no_content, target_timeout, ...
         print(f"Extraction failed ({e.code}): {e.message}")
 ```
 
@@ -237,7 +237,7 @@ with WellMarked() as wm:
 | `AuthenticationError`      | 401  | `missing_api_key`, `invalid_api_key`                                         |
 | `PermissionDeniedError`    | 403  | `account_inactive`, `plan_not_supported`, `forbidden`                        |
 | `NotFoundError`            | 404  | `job_not_found`                                                              |
-| `UnprocessableEntityError` | 422  | `no_content`, `target_timeout`, `js_rendering_disabled`, `bulk_cap_exceeded`, `crawl_depth_exceeded` |
+| `UnprocessableEntityError` | 422  | `no_content`, `target_timeout`, `bulk_cap_exceeded`, `crawl_depth_exceeded`                          |
 | `RateLimitError`           | 429  | `rate_limit_too_fast` *(per-second cap; `retry_after_ms` carries the sub-second back-off)* · `rate_limit_exceeded` *(monthly quota; `retry_after` in seconds)* |
 | `InternalServerError`      | 5xx  | —                                                                            |
 | `APIConnectionError`       | —    | DNS / TCP / TLS / timeout failures, raised before any HTTP round-trip        |

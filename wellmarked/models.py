@@ -82,6 +82,62 @@ class ExtractResult:
         )
 
 
+# ── Search ────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class SearchResult:
+    """One result in a :class:`SearchResults`.
+
+    On success ``status == "ok"`` and ``markdown`` is populated; on a per-page
+    failure ``status == "error"`` and ``error`` carries a stable code (same
+    convention as :class:`BulkItem.error`). ``title`` is the extracted title on
+    success, else the search provider's; ``snippet`` is always the provider's
+    result snippet, so a page that failed extraction still carries context.
+    """
+    url: str
+    status: str            # "ok" | "error"
+    title: Optional[str] = None
+    snippet: Optional[str] = None
+    markdown: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SearchResult":
+        return cls(
+            url=str(data.get("url", "")),
+            status=str(data.get("status", "error")),
+            title=data.get("title"),
+            snippet=data.get("snippet"),
+            markdown=data.get("markdown"),
+            error=data.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class SearchResults:
+    """Result of ``POST /search`` — the query plus the extracted result pages.
+
+    Synchronous: unlike bulk/crawl there is no job to poll; ``results`` is
+    already populated (with partial failures marked per item).
+    """
+    query: str
+    results: List[SearchResult]
+    request_id: str
+
+    @classmethod
+    def from_response(cls, body: Mapping[str, Any]) -> "SearchResults":
+        raw = body.get("results") or []
+        return cls(
+            query=str(body.get("query", "")),
+            results=[SearchResult.from_dict(r) for r in raw],
+            request_id=str(body.get("request_id", "")),
+        )
+
+
 # ── Bulk ──────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -90,7 +146,9 @@ class BulkItem:
 
     On success, ``markdown`` and ``metadata`` are populated and ``error`` is
     ``None``. On a per-URL failure, ``markdown``/``metadata`` are ``None`` and
-    ``error`` carries an API error code (e.g. ``target_timeout``).
+    ``error`` carries a stable API error **code** — never a human message — e.g.
+    ``target_timeout``, ``domain_denied``, ``internal_error``. Same convention
+    as :class:`CrawlItem.error`, so results parse identically on either endpoint.
     """
     url: str
     markdown: Optional[str] = None
@@ -289,6 +347,151 @@ class RotatedKey:
         return cls(
             api_key=str(body.get("api_key", "")),
             rotated_at=_parse_dt(body.get("rotated_at")),
+        )
+
+
+# ── Self-registration ─────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class RegisteredAccount:
+    """Result of :meth:`wellmarked.WellMarked.register` (``POST /register``).
+
+    ``api_key`` is the new raw key — shown once, store it. The account is
+    deliberately weak: ``plan="free"`` and ``scopes=["extract"]``. Build a
+    client with it via ``WellMarked(api_key=account.api_key)``.
+    """
+    api_key: str
+    user_id: str
+    plan: str
+    scopes: List[str]
+
+    @classmethod
+    def from_response(cls, body: Mapping[str, Any]) -> "RegisteredAccount":
+        return cls(
+            api_key=str(body.get("api_key", "")),
+            user_id=str(body.get("user_id", "")),
+            plan=str(body.get("plan", "")),
+            scopes=list(body.get("scopes") or []),
+        )
+
+
+# ── Key management (scoped keys) ──────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CreatedKey:
+    """Result of ``create_key`` (``POST /keys``).
+
+    ``api_key`` is the new raw key — shown once, store it before discarding this
+    object. ``scopes`` is the subset it was granted (extract / bulk / crawl /
+    keys).
+    """
+    id: str
+    api_key: str
+    name: str
+    scopes: List[str]
+    created_at: Optional[datetime] = None
+
+    @classmethod
+    def from_response(cls, body: Mapping[str, Any]) -> "CreatedKey":
+        return cls(
+            id=str(body.get("id", "")),
+            api_key=str(body.get("api_key", "")),
+            name=str(body.get("name", "")),
+            scopes=list(body.get("scopes") or []),
+            created_at=_parse_dt(body.get("created_at")),
+        )
+
+
+@dataclass(frozen=True)
+class ApiKeyInfo:
+    """One key's metadata from ``list_keys`` (``GET /keys``). Never carries the
+    raw key. ``revoked_at`` is set once the key has been revoked."""
+    id: str
+    name: str
+    scopes: List[str]
+    created_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+    @property
+    def active(self) -> bool:
+        return self.revoked_at is None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ApiKeyInfo":
+        return cls(
+            id=str(data.get("id", "")),
+            name=str(data.get("name", "")),
+            scopes=list(data.get("scopes") or []),
+            created_at=_parse_dt(data.get("created_at")),
+            revoked_at=_parse_dt(data.get("revoked_at")),
+        )
+
+
+@dataclass(frozen=True)
+class RevokedKey:
+    """Result of ``revoke_key`` (``DELETE /keys/{id}``)."""
+    id: str
+    revoked_at: Optional[datetime] = None
+
+    @classmethod
+    def from_response(cls, body: Mapping[str, Any]) -> "RevokedKey":
+        return cls(
+            id=str(body.get("id", "")),
+            revoked_at=_parse_dt(body.get("revoked_at")),
+        )
+
+
+# ── Audit log ─────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class LogEntry:
+    """One row of your request history from ``get_logs`` (``GET /logs``).
+
+    ``policy_decision`` records how the key's compliance policy decided:
+    ``"allowed"`` | ``"domain_not_allowed"`` | ``"domain_denied"`` |
+    ``"robots_disallowed"``. ``key_id`` attributes the request to a key.
+    """
+    id: str
+    target_url: str
+    status_code: int
+    duration_ms: int
+    timestamp: Optional[datetime] = None
+    error_code: Optional[str] = None
+    render_js: Optional[bool] = None
+    key_id: Optional[str] = None
+    policy_decision: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "LogEntry":
+        return cls(
+            id=str(data.get("id", "")),
+            target_url=str(data.get("target_url", "")),
+            status_code=int(data.get("status_code", 0)),
+            duration_ms=int(data.get("duration_ms", 0)),
+            timestamp=_parse_dt(data.get("timestamp")),
+            error_code=data.get("error_code"),
+            render_js=data.get("render_js"),
+            key_id=data.get("key_id"),
+            policy_decision=data.get("policy_decision"),
+        )
+
+
+@dataclass(frozen=True)
+class LogsPage:
+    """One page of ``get_logs`` results. ``has_more`` is True when further rows
+    exist beyond this page — advance by ``offset += limit``."""
+    logs: List[LogEntry]
+    limit: int
+    offset: int
+    has_more: bool
+
+    @classmethod
+    def from_response(cls, body: Mapping[str, Any]) -> "LogsPage":
+        return cls(
+            logs=[LogEntry.from_dict(r) for r in (body.get("logs") or [])],
+            limit=int(body.get("limit", 0)),
+            offset=int(body.get("offset", 0)),
+            has_more=bool(body.get("has_more", False)),
         )
 
 

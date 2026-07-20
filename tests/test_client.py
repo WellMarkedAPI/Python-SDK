@@ -6,6 +6,7 @@ import pytest
 import respx
 
 from wellmarked import (
+    APIConnectionError,
     AsyncWellMarked,
     AuthenticationError,
     BulkItem,
@@ -14,6 +15,8 @@ from wellmarked import (
     ExtractResult,
     PermissionDeniedError,
     RateLimitError,
+    SearchResult,
+    SearchResults,
     UnprocessableEntityError,
     WellMarked,
     WellMarkedError,
@@ -844,3 +847,504 @@ def test_extract_result_attributes_match_api_contract() -> None:
     from dataclasses import fields
     field_names = {f.name for f in fields(result)}
     assert field_names == {"markdown", "metadata", "request_id"}
+
+
+# ── Idempotency-Key ───────────────────────────────────────────────────────────
+# The header is what makes a retried /bulk replay the original job instead of
+# double-charging the caller's quota. If the SDK silently stops sending it, the
+# API's protection is inert and nothing else would notice.
+
+_QUEUED_JOB = {
+    "job_id": "1c4f9a02-0000-0000-0000-000000000000",
+    "status": "queued",
+    "total": 1,
+    "completed": 0,
+    "results": [],
+}
+
+
+@respx.mock
+def test_bulk_sends_generated_idempotency_key_by_default() -> None:
+    route = respx.post(f"{BASE_URL}/bulk").mock(
+        return_value=httpx.Response(200, json=_QUEUED_JOB)
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.bulk(["https://a.example"])
+
+    sent = route.calls.last.request.headers.get("Idempotency-Key")
+    assert sent, "bulk() must send an Idempotency-Key even when none is passed"
+
+
+@respx.mock
+def test_bulk_honours_an_explicit_idempotency_key() -> None:
+    route = respx.post(f"{BASE_URL}/bulk").mock(
+        return_value=httpx.Response(200, json=_QUEUED_JOB)
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.bulk(["https://a.example"], idempotency_key="caller-chosen")
+
+    assert route.calls.last.request.headers["Idempotency-Key"] == "caller-chosen"
+
+
+@respx.mock
+def test_each_bulk_call_gets_a_distinct_generated_key() -> None:
+    """Two separate submissions are two operations. Reusing one key across them
+    would make the second replay the first one's job."""
+    route = respx.post(f"{BASE_URL}/bulk").mock(
+        return_value=httpx.Response(200, json=_QUEUED_JOB)
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.bulk(["https://a.example"])
+        wm.bulk(["https://b.example"])
+
+    first = route.calls[0].request.headers["Idempotency-Key"]
+    second = route.calls[1].request.headers["Idempotency-Key"]
+    assert first != second
+
+
+@respx.mock
+def test_crawl_sends_idempotency_key() -> None:
+    route = respx.post(f"{BASE_URL}/crawl").mock(
+        return_value=httpx.Response(
+            200,
+            json={**_QUEUED_JOB, "kind": "crawl", "total": 0,
+                  "truncated": False, "truncated_reason": None},
+        )
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.crawl("https://a.example", depth=1)
+
+    assert route.calls.last.request.headers.get("Idempotency-Key")
+
+
+@respx.mock
+def test_per_request_headers_cannot_override_authorization() -> None:
+    """The per-request channel must honour RESERVED_HEADERS too — a stray
+    Authorization would break rotate_key() mid-session."""
+    route = respx.post(f"{BASE_URL}/bulk").mock(
+        return_value=httpx.Response(200, json=_QUEUED_JOB)
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm._request(
+            "POST", "/bulk", json={"urls": ["https://a.example"]},
+            headers={"Authorization": "Bearer attacker", "X-Custom": "kept"},
+        )
+
+    sent = route.calls.last.request.headers
+    assert sent["Authorization"] == f"Bearer {API_KEY}"
+    assert sent["X-Custom"] == "kept"
+
+
+@respx.mock
+async def test_async_bulk_sends_idempotency_key() -> None:
+    route = respx.post(f"{BASE_URL}/bulk").mock(
+        return_value=httpx.Response(200, json=_QUEUED_JOB)
+    )
+    async with AsyncWellMarked(api_key=API_KEY) as wm:
+        await wm.bulk(["https://a.example"])
+
+    assert route.calls.last.request.headers.get("Idempotency-Key")
+
+
+# ── Internal retry ────────────────────────────────────────────────────────────
+# Retries exist so the auto-generated Idempotency-Key is worth something: a
+# connection blip is ambiguous (the job may already exist), and replaying with
+# the SAME key collapses the attempts into one job instead of two.
+
+
+@respx.mock
+def test_bulk_retries_connection_error_reusing_the_same_key() -> None:
+    seen: list[str] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["Idempotency-Key"])
+        if len(seen) == 1:
+            raise httpx.ConnectError("network down")
+        return httpx.Response(200, json=_QUEUED_JOB)
+
+    respx.post(f"{BASE_URL}/bulk").mock(side_effect=responder)
+
+    with WellMarked(api_key=API_KEY) as wm:
+        job = wm.bulk(["https://a.example"])
+
+    assert job.status == "queued"
+    assert len(seen) == 2
+    # The whole point: both attempts carry the SAME key, so the API replays
+    # rather than creating a second job.
+    assert seen[0] == seen[1]
+
+
+@respx.mock
+def test_extract_is_never_retried() -> None:
+    """A connection error can't tell us whether the extraction happened, and
+    /extract takes no Idempotency-Key — so replaying could bill twice."""
+    calls = {"n": 0}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ConnectError("network down")
+
+    respx.post(f"{BASE_URL}/extract").mock(side_effect=responder)
+
+    with WellMarked(api_key=API_KEY) as wm:
+        with pytest.raises(APIConnectionError):
+            wm.extract("https://a.example")
+
+    assert calls["n"] == 1
+
+
+@respx.mock
+def test_bulk_retries_5xx_but_not_4xx() -> None:
+    calls = {"n": 0}
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, json={"error": {"code": "x", "message": "down"}})
+        return httpx.Response(200, json=_QUEUED_JOB)
+
+    respx.post(f"{BASE_URL}/bulk").mock(side_effect=flaky)
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.bulk(["https://a.example"])
+    assert calls["n"] == 2
+
+    respx.post(f"{BASE_URL}/crawl").mock(
+        return_value=httpx.Response(
+            422, json={"error": {"code": "crawl_depth_exceeded", "message": "too deep"}}
+        )
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        with pytest.raises(UnprocessableEntityError):
+            wm.crawl("https://a.example", depth=99)
+    # 4xx is deterministic — replaying just reproduces it.
+    assert respx.routes[-1].call_count == 1
+
+
+@respx.mock
+def test_max_retries_zero_disables_retrying() -> None:
+    calls = {"n": 0}
+
+    def down(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ConnectError("network down")
+
+    respx.post(f"{BASE_URL}/bulk").mock(side_effect=down)
+    with WellMarked(api_key=API_KEY, max_retries=0) as wm:
+        with pytest.raises(APIConnectionError):
+            wm.bulk(["https://a.example"])
+    assert calls["n"] == 1
+
+
+@respx.mock
+async def test_async_bulk_retries_connection_error() -> None:
+    seen: list[str] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["Idempotency-Key"])
+        if len(seen) == 1:
+            raise httpx.ConnectError("network down")
+        return httpx.Response(200, json=_QUEUED_JOB)
+
+    respx.post(f"{BASE_URL}/bulk").mock(side_effect=responder)
+    async with AsyncWellMarked(api_key=API_KEY) as wm:
+        await wm.bulk(["https://a.example"])
+
+    assert len(seen) == 2 and seen[0] == seen[1]
+
+
+@respx.mock
+def test_client_wide_idempotency_key_does_not_make_extract_retryable() -> None:
+    """Regression guard, mirroring the JS SDK.
+
+    Idempotency-Key isn't reserved, so a caller can legally set it client-wide
+    via ``set_header``. Replay-safety must still be judged on the PER-REQUEST
+    headers only: /extract is billed on arrival and ignores the header, so
+    retrying it would double-charge.
+    """
+    calls = {"n": 0}
+
+    def down(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ConnectError("network down")
+
+    respx.post(f"{BASE_URL}/extract").mock(side_effect=down)
+
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.set_header("Idempotency-Key", "smuggled")
+        with pytest.raises(APIConnectionError):
+            wm.extract("https://a.example")
+
+    assert calls["n"] == 1
+
+
+@respx.mock
+def test_constructor_idempotency_key_does_not_make_extract_retryable() -> None:
+    calls = {"n": 0}
+
+    def down(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ConnectError("network down")
+
+    respx.post(f"{BASE_URL}/extract").mock(side_effect=down)
+
+    with WellMarked(api_key=API_KEY, headers={"Idempotency-Key": "smuggled"}) as wm:
+        with pytest.raises(APIConnectionError):
+            wm.extract("https://a.example")
+
+    assert calls["n"] == 1
+
+
+# ── Phase 5 continuity: policy overrides, key CRUD, logs ──────────────────────
+
+import json as _json
+
+from wellmarked import ApiKeyInfo, CreatedKey, LogsPage, RevokedKey
+
+
+@respx.mock
+def test_extract_sends_policy_overrides() -> None:
+    route = respx.post(f"{BASE_URL}/extract").mock(
+        return_value=httpx.Response(200, json={
+            "markdown": "# ok",
+            "metadata": {"url": "https://a.example"},
+            "request_id": "r1",
+        })
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.extract(
+            "https://a.example",
+            allow_domains=["a.example"],
+            deny_patterns=["*/admin/*"],
+            respect_robots="strict",
+        )
+    sent = _json.loads(route.calls.last.request.content)
+    assert sent["allow_domains"] == ["a.example"]
+    assert sent["deny_patterns"] == ["*/admin/*"]
+    assert sent["respect_robots"] == "strict"
+
+
+@respx.mock
+def test_extract_omits_unset_policy_fields() -> None:
+    """An override left unset must not appear in the body — otherwise it would
+    overwrite the key's own policy with an empty value."""
+    route = respx.post(f"{BASE_URL}/extract").mock(
+        return_value=httpx.Response(200, json={
+            "markdown": "# ok", "metadata": {"url": "https://a.example"}, "request_id": "r1",
+        })
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.extract("https://a.example")
+    sent = _json.loads(route.calls.last.request.content)
+    assert "allow_domains" not in sent and "deny_patterns" not in sent
+    assert "respect_robots" not in sent
+
+
+@respx.mock
+def test_policy_denial_raises_permission_denied() -> None:
+    respx.post(f"{BASE_URL}/extract").mock(
+        return_value=httpx.Response(403, json={
+            "error": {"code": "domain_denied", "message": "denied", "retry": False},
+        })
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        with pytest.raises(PermissionDeniedError) as ei:
+            wm.extract("https://blocked.example")
+    assert ei.value.code == "domain_denied"
+
+
+@respx.mock
+def test_create_key() -> None:
+    route = respx.post(f"{BASE_URL}/keys").mock(
+        return_value=httpx.Response(200, json={
+            "id": "k1", "api_key": "wm_" + "b" * 40, "name": "ci",
+            "scopes": ["extract"], "created_at": "2026-07-17T00:00:00Z",
+        })
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        key = wm.create_key(["extract"], name="ci")
+    assert isinstance(key, CreatedKey)
+    assert key.scopes == ["extract"] and key.api_key.startswith("wm_")
+    sent = _json.loads(route.calls.last.request.content)
+    assert sent == {"scopes": ["extract"], "name": "ci"}
+
+
+@respx.mock
+def test_list_keys() -> None:
+    respx.get(f"{BASE_URL}/keys").mock(
+        return_value=httpx.Response(200, json={"keys": [
+            {"id": "k1", "name": "default", "scopes": ["*"],
+             "created_at": "2026-07-01T00:00:00Z", "revoked_at": None},
+            {"id": "k2", "name": "ci", "scopes": ["extract"],
+             "created_at": "2026-07-02T00:00:00Z", "revoked_at": "2026-07-03T00:00:00Z"},
+        ]})
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        keys = wm.list_keys()
+    assert [k.id for k in keys] == ["k1", "k2"]
+    assert keys[0].active is True and keys[1].active is False
+    assert all(isinstance(k, ApiKeyInfo) for k in keys)
+
+
+@respx.mock
+def test_revoke_key() -> None:
+    route = respx.delete(f"{BASE_URL}/keys/k2").mock(
+        return_value=httpx.Response(200, json={
+            "id": "k2", "revoked_at": "2026-07-03T00:00:00Z",
+        })
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        revoked = wm.revoke_key("k2")
+    assert isinstance(revoked, RevokedKey) and revoked.id == "k2"
+    assert route.calls.last.request.method == "DELETE"
+
+
+@respx.mock
+def test_get_logs_pagination() -> None:
+    route = respx.get(f"{BASE_URL}/logs").mock(
+        return_value=httpx.Response(200, json={
+            "logs": [{
+                "id": "r1", "timestamp": "2026-07-17T00:00:00Z",
+                "target_url": "https://a.example", "status_code": 403,
+                "duration_ms": 3, "error_code": "domain_denied",
+                "render_js": False, "key_id": "k1",
+                "policy_decision": "domain_denied",
+            }],
+            "limit": 50, "offset": 0, "has_more": True,
+        })
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        page = wm.get_logs(limit=50, offset=0)
+    assert isinstance(page, LogsPage) and page.has_more is True
+    assert page.logs[0].policy_decision == "domain_denied"
+    assert page.logs[0].key_id == "k1"
+    q = str(route.calls.last.request.url)
+    assert "limit=50" in q and "offset=0" in q
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_create_key_and_logs() -> None:
+    respx.post(f"{BASE_URL}/keys").mock(
+        return_value=httpx.Response(200, json={
+            "id": "k1", "api_key": "wm_" + "c" * 40, "name": "x",
+            "scopes": ["extract"], "created_at": "2026-07-17T00:00:00Z",
+        })
+    )
+    respx.get(f"{BASE_URL}/logs").mock(
+        return_value=httpx.Response(200, json={"logs": [], "limit": 50, "offset": 0, "has_more": False})
+    )
+    async with AsyncWellMarked(api_key=API_KEY) as wm:
+        key = await wm.create_key(["extract"], name="x")
+        page = await wm.get_logs()
+    assert key.id == "k1" and page.has_more is False
+
+
+# ── Phase 6: self-registration ────────────────────────────────────────────────
+
+from wellmarked import RegisteredAccount
+
+
+@respx.mock
+def test_register_returns_account() -> None:
+    route = respx.post(f"{BASE_URL}/register").mock(
+        return_value=httpx.Response(200, json={
+            "api_key": "wm_" + "d" * 40,
+            "user_id": "u1",
+            "plan": "free",
+            "scopes": ["extract"],
+        })
+    )
+    account = WellMarked.register("agent@example.com", base_url=BASE_URL)
+    assert isinstance(account, RegisteredAccount)
+    assert account.api_key.startswith("wm_")
+    assert account.plan == "free" and account.scopes == ["extract"]
+    # No auth header required — register is pre-key.
+    sent = route.calls.last.request
+    assert "authorization" not in {k.lower() for k in sent.headers.keys()}
+    import json as _json
+    assert _json.loads(sent.content) == {"email": "agent@example.com"}
+
+
+@respx.mock
+def test_register_rate_limited_raises() -> None:
+    respx.post(f"{BASE_URL}/register").mock(
+        return_value=httpx.Response(429, json={
+            "error": {"code": "register_rate_limited", "message": "slow down", "retry": True},
+        })
+    )
+    with pytest.raises(RateLimitError) as ei:
+        WellMarked.register("agent@example.com", base_url=BASE_URL)
+    assert ei.value.code == "register_rate_limited"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_register() -> None:
+    respx.post(f"{BASE_URL}/register").mock(
+        return_value=httpx.Response(200, json={
+            "api_key": "wm_" + "e" * 40, "user_id": "u2",
+            "plan": "free", "scopes": ["extract"],
+        })
+    )
+    account = await AsyncWellMarked.register("agent@example.com", base_url=BASE_URL)
+    assert account.user_id == "u2" and account.scopes == ["extract"]
+
+
+# ── Search ──────────────────────────────────────────────────────────────────────
+
+_SEARCH_BODY = {
+    "query": "python asyncio",
+    "results": [
+        {"url": "https://a.test/1", "status": "ok", "title": "A", "snippet": "s1", "markdown": "# A"},
+        {"url": "https://b.test/2", "status": "error", "title": "B", "snippet": "s2", "error": "target_timeout"},
+    ],
+    "request_id": "33333333-3333-3333-3333-333333333333",
+}
+
+
+@respx.mock
+def test_search_success() -> None:
+    route = respx.post(f"{BASE_URL}/search").mock(
+        return_value=httpx.Response(200, json=_SEARCH_BODY)
+    )
+
+    with WellMarked(api_key=API_KEY) as wm:
+        res = wm.search("python asyncio", num_results=2)
+
+    # Request shape reached the server unchanged.
+    import json as _json
+    sent = _json.loads(route.calls.last.request.content)
+    assert sent == {"query": "python asyncio", "num_results": 2, "render_js": False}
+
+    assert isinstance(res, SearchResults) and res.query == "python asyncio"
+    assert res.request_id == "33333333-3333-3333-3333-333333333333"
+    assert len(res.results) == 2
+    ok, err = res.results
+    assert isinstance(ok, SearchResult) and ok.ok and ok.markdown == "# A" and ok.title == "A"
+    # A failed page still carries the provider snippet + a stable error code.
+    assert not err.ok and err.error == "target_timeout" and err.snippet == "s2"
+
+
+@respx.mock
+def test_search_plan_gate_raises() -> None:
+    respx.post(f"{BASE_URL}/search").mock(
+        return_value=httpx.Response(
+            403, json={"error": {"code": "plan_not_supported", "message": "Pro+ only."}}
+        )
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        with pytest.raises(PermissionDeniedError) as ei:
+            wm.search("q")
+    assert ei.value.code == "plan_not_supported"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_search_success() -> None:
+    respx.post(f"{BASE_URL}/search").mock(
+        return_value=httpx.Response(200, json=_SEARCH_BODY)
+    )
+    async with AsyncWellMarked(api_key=API_KEY) as wm:
+        res = await wm.search("python asyncio")
+    assert isinstance(res, SearchResults) and len(res.results) == 2
+    assert res.results[0].ok and res.results[1].error == "target_timeout"

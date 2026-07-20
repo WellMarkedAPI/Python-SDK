@@ -9,13 +9,23 @@ import httpx
 
 from ._base import (
     DEFAULT_BASE_URL,
+    DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
+    backoff_seconds,
+    is_safe_to_replay,
     merge_headers,
+    new_idempotency_key,
     parse_response,
+    policy_overrides,
     resolve_api_key,
+    sanitize_headers,
     wrap_transport_error,
 )
-from .models import BulkJob, CrawlJob, ExtractResult, RotatedKey, RotatedWebhookSecret, Usage
+from .models import (
+    ApiKeyInfo, BulkJob, CrawlJob, CreatedKey, ExtractResult, LogsPage,
+    RegisteredAccount, RevokedKey, RotatedKey, RotatedWebhookSecret,
+    SearchResults, Usage,
+)
 
 
 class AsyncWellMarked:
@@ -37,13 +47,16 @@ class AsyncWellMarked:
         *,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: Optional[httpx.AsyncClient] = None,
         headers: Optional[dict[str, str]] = None,
     ) -> None:
         """Async equivalent of :class:`wellmarked.WellMarked`. See its docstring
-        for the full parameter description, including ``headers``."""
+        for the full parameter description, including ``headers`` and
+        ``max_retries``."""
         self._api_key = resolve_api_key(api_key)
         self._base_url = base_url.rstrip("/")
+        self._max_retries = max(0, max_retries)
         self._extra_headers: dict[str, str] = dict(headers or {})
         merged = merge_headers(self._api_key, self._extra_headers)
         self._owns_client = http_client is None
@@ -54,6 +67,40 @@ class AsyncWellMarked:
         )
         if not self._owns_client:
             self._client.headers.update(merged)
+
+    # ── Self-registration ─────────────────────────────────────────────────────
+
+    @classmethod
+    async def register(
+        cls,
+        email: str,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float = DEFAULT_TIMEOUT,
+        http_client: Optional[httpx.AsyncClient] = None,
+    ) -> RegisteredAccount:
+        """Self-register for a free, extract-only API key. See
+        :meth:`WellMarked.register`. Not retried (registration isn't idempotent)."""
+        url = f"{base_url.rstrip('/')}/register"
+        owns = http_client is None
+        client = http_client or httpx.AsyncClient(timeout=timeout)
+        try:
+            try:
+                response = await client.post(url, json={"email": email})
+            except httpx.HTTPError as exc:
+                raise wrap_transport_error(exc)
+            try:
+                assert response.content
+                body = response.json()
+            except (AssertionError, ValueError):
+                body = None
+            data = parse_response(
+                response.status_code, body, headers=dict(response.headers),
+            )
+        finally:
+            if owns:
+                await client.aclose()
+        return RegisteredAccount.from_response(data)
 
     # ── Context manager ───────────────────────────────────────────────────────
 
@@ -70,12 +117,33 @@ class AsyncWellMarked:
 
     # ── Endpoints ─────────────────────────────────────────────────────────────
 
-    async def extract(self, url: str, *, render_js: bool = False) -> ExtractResult:
+    async def extract(
+        self,
+        url: str,
+        *,
+        render_js: bool = False,
+        allow_domains: Optional[Iterable[str]] = None,
+        deny_patterns: Optional[Iterable[str]] = None,
+        respect_robots: Optional[str] = None,
+    ) -> ExtractResult:
         """Extract clean Markdown from a single URL. See :meth:`WellMarked.extract`."""
-        body = await self._request(
-            "POST", "/extract", json={"url": url, "render_js": render_js}
-        )
+        payload: dict[str, object] = {"url": url, "render_js": render_js}
+        payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
+        body = await self._request("POST", "/extract", json=payload)
         return ExtractResult.from_response(body)
+
+    async def search(
+        self,
+        query: str,
+        *,
+        num_results: int = 5,
+        render_js: bool = False,
+    ) -> SearchResults:
+        """Search the web and extract each result to Markdown. See
+        :meth:`WellMarked.search`."""
+        payload = {"query": query, "num_results": num_results, "render_js": render_js}
+        body = await self._request("POST", "/search", json=payload)
+        return SearchResults.from_response(body)
 
     async def bulk(
         self,
@@ -84,6 +152,10 @@ class AsyncWellMarked:
         render_js: bool = False,
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
+        idempotency_key: Optional[str] = None,
+        allow_domains: Optional[Iterable[str]] = None,
+        deny_patterns: Optional[Iterable[str]] = None,
+        respect_robots: Optional[str] = None,
     ) -> BulkJob:
         """Submit a batch of URLs for concurrent extraction. See :meth:`WellMarked.bulk`."""
         url_list = list(urls)
@@ -93,7 +165,11 @@ class AsyncWellMarked:
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
-        body = await self._request("POST", "/bulk", json=payload)
+        payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
+        body = await self._request(
+            "POST", "/bulk", json=payload,
+            headers={"Idempotency-Key": idempotency_key or new_idempotency_key()},
+        )
         return BulkJob.from_response(body)
 
     async def get_job(self, job_id: str) -> Union[BulkJob, CrawlJob]:
@@ -143,6 +219,10 @@ class AsyncWellMarked:
         render_js: bool = False,
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
+        idempotency_key: Optional[str] = None,
+        allow_domains: Optional[Iterable[str]] = None,
+        deny_patterns: Optional[Iterable[str]] = None,
+        respect_robots: Optional[str] = None,
     ) -> CrawlJob:
         """Crawl a site starting from ``url``. See :meth:`WellMarked.crawl`."""
         if depth < 0:
@@ -153,7 +233,11 @@ class AsyncWellMarked:
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
-        body = await self._request("POST", "/crawl", json=payload)
+        payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
+        body = await self._request(
+            "POST", "/crawl", json=payload,
+            headers={"Idempotency-Key": idempotency_key or new_idempotency_key()},
+        )
         return CrawlJob.from_response(body)
 
     # ── Custom headers ────────────────────────────────────────────────────────
@@ -189,21 +273,75 @@ class AsyncWellMarked:
         body = await self._request("POST", "/webhook/rotate")
         return RotatedWebhookSecret.from_response(body)
 
+    # ── Key management (scoped keys) ──────────────────────────────────────────
+
+    async def create_key(self, scopes: Iterable[str], *, name: str = "default") -> CreatedKey:
+        """Mint a new scoped API key. See :meth:`WellMarked.create_key`."""
+        body = await self._request(
+            "POST", "/keys", json={"scopes": list(scopes), "name": name},
+        )
+        return CreatedKey.from_response(body)
+
+    async def list_keys(self) -> list[ApiKeyInfo]:
+        """List this account's keys (metadata only). See :meth:`WellMarked.list_keys`."""
+        body = await self._request("GET", "/keys")
+        return [ApiKeyInfo.from_dict(k) for k in (body.get("keys") or [])]
+
+    async def revoke_key(self, key_id: str) -> RevokedKey:
+        """Revoke a key by id. See :meth:`WellMarked.revoke_key`."""
+        body = await self._request("DELETE", f"/keys/{key_id}")
+        return RevokedKey.from_response(body)
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+
+    async def get_logs(self, *, limit: int = 50, offset: int = 0) -> LogsPage:
+        """Return this account's request history. See :meth:`WellMarked.get_logs`."""
+        body = await self._request("GET", f"/logs?limit={int(limit)}&offset={int(offset)}")
+        return LogsPage.from_response(body)
+
     # ── Transport ─────────────────────────────────────────────────────────────
 
-    async def _request(self, method: str, path: str, *, json: object = None) -> Any:
-        # See WellMarked._request for why we build absolute URLs ourselves.
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: object = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Any:
+        # See WellMarked._request — this mirrors the sync client exactly,
+        # including the replay-safety rule and the backoff schedule.
         url = f"{self._base_url}{path}"
-        try:
-            response = await self._client.request(method, url, json=json)
-        except httpx.HTTPError as exc:
-            raise wrap_transport_error(exc) from exc
+        extra = sanitize_headers(headers)
+        attempts = self._max_retries + 1 if is_safe_to_replay(method, extra) else 1
+        last_exc: Optional[Exception] = None
 
-        try:
-            assert response.content
-            body = response.json()
-        except (AssertionError, ValueError):
-            body = None
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(backoff_seconds(attempt))
+            try:
+                # Per-request headers go to httpx, never onto the shared
+                # client: this client is used concurrently, so mutating
+                # client.headers would leak one call's headers into another's.
+                response = await self._client.request(
+                    method, url, json=json, headers=extra,
+                )
+            except httpx.HTTPError as exc:
+                last_exc = wrap_transport_error(exc)
+                continue
+
+            if response.status_code >= 500 and attempt < attempts - 1:
+                continue
+
+            try:
+                assert response.content
+                body = response.json()
+            except (AssertionError, ValueError):
+                body = None
+            break
+        else:
+            assert last_exc is not None
+            raise last_exc
 
         # httpx Headers is dict-like for our purposes; pass it through so
         # parse_response can read Retry-After-Ms on rate-limit 429s.
