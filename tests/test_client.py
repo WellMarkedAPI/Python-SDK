@@ -1,20 +1,27 @@
 """Mocked-transport tests for the sync and async clients."""
 from __future__ import annotations
 
+import json as _json
+
 import httpx
 import pytest
 import respx
 
 from wellmarked import (
     APIConnectionError,
+    ApiKeyInfo,
     AsyncWellMarked,
     AuthenticationError,
     BulkItem,
     CrawlJob,
+    CreatedKey,
     ExtractionMeta,
     ExtractResult,
+    LogsPage,
     PermissionDeniedError,
     RateLimitError,
+    RegisteredAccount,
+    RevokedKey,
     SearchResult,
     SearchResults,
     UnprocessableEntityError,
@@ -1096,10 +1103,6 @@ def test_constructor_idempotency_key_does_not_make_extract_retryable() -> None:
 
 # ── Phase 5 continuity: policy overrides, key CRUD, logs ──────────────────────
 
-import json as _json
-
-from wellmarked import ApiKeyInfo, CreatedKey, LogsPage, RevokedKey
-
 
 @respx.mock
 def test_extract_sends_policy_overrides() -> None:
@@ -1241,8 +1244,6 @@ async def test_async_create_key_and_logs() -> None:
 
 # ── Phase 6: self-registration ────────────────────────────────────────────────
 
-from wellmarked import RegisteredAccount
-
 
 @respx.mock
 def test_register_returns_account() -> None:
@@ -1312,7 +1313,6 @@ def test_search_success() -> None:
         res = wm.search("python asyncio", num_results=2)
 
     # Request shape reached the server unchanged.
-    import json as _json
     sent = _json.loads(route.calls.last.request.content)
     assert sent == {"query": "python asyncio", "num_results": 2, "render_js": False}
 

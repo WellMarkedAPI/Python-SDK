@@ -101,7 +101,9 @@ def backoff_seconds(attempt: int) -> float:
     lockstep and hit the API as a thundering herd at exactly the moment it is
     already struggling.
     """
-    base = min(0.5 * (2 ** (attempt - 1)), 4.0)
+    # Annotated: int ** int widens to Any for mypy (a negative exponent would
+    # yield float), which would otherwise leak Any out of this float function.
+    base: float = min(0.5 * (2 ** (attempt - 1)), 4.0)
     return base + random.random() * 0.25
 
 
@@ -109,7 +111,7 @@ def policy_overrides(
     allow_domains: Optional[Iterable[str]] = None,
     deny_patterns: Optional[Iterable[str]] = None,
     respect_robots: Optional[str] = None,
-) -> dict:
+) -> dict[str, Any]:
     """Build the per-request compliance-override fields for extract/bulk/crawl.
 
     Only fields the caller set are included — an omitted override leaves the
@@ -117,7 +119,7 @@ def policy_overrides(
     server-side (add denies, restrict domains, upgrade robots to strict), never
     widen it; see the API's services/policy.narrow.
     """
-    out: dict = {}
+    out: dict[str, Any] = {}
     if allow_domains is not None:
         out["allow_domains"] = list(allow_domains)
     if deny_patterns is not None:
