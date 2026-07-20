@@ -175,6 +175,7 @@ class WellMarked:
         url: str,
         *,
         render_js: bool = False,
+        format: str = "markdown",
         allow_domains: Optional[Iterable[str]] = None,
         deny_patterns: Optional[Iterable[str]] = None,
         respect_robots: Optional[str] = None,
@@ -186,6 +187,11 @@ class WellMarked:
             render_js: Use Playwright to render JS-heavy pages. Requires a
                 Pro, Growth, or Enterprise plan; Free returns
                 ``plan_not_supported``.
+            format: Output format — ``"markdown"`` (default), ``"json"``
+                (typed heading/paragraph/list/code blocks), ``"chunks"``
+                (contiguous 500-token windows for embedding), ``"html"`` (the
+                raw fetched HTML) or ``"links"`` (every http(s) link found).
+                The result populates the matching field; the others stay None.
             allow_domains: Restrict this request to these domains (and their
                 subdomains). Can only narrow your key's own allowlist, never
                 widen it.
@@ -202,7 +208,7 @@ class WellMarked:
             UnprocessableEntityError: ``no_content`` or ``target_timeout``.
             AuthenticationError: Missing or invalid API key.
         """
-        payload: dict[str, object] = {"url": url, "render_js": render_js}
+        payload: dict[str, object] = {"url": url, "render_js": render_js, "format": format}
         payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
         body = self._request("POST", "/extract", json=payload)
         return ExtractResult.from_response(body)
@@ -244,6 +250,7 @@ class WellMarked:
         urls: Iterable[str],
         *,
         render_js: bool = False,
+        format: str = "markdown",
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
         idempotency_key: Optional[str] = None,
@@ -264,6 +271,11 @@ class WellMarked:
         Args:
             urls: The URLs to extract from.
             render_js: Use Playwright to render JS-heavy pages.
+            format: Output format — ``"markdown"`` (default), ``"json"``
+                (typed heading/paragraph/list/code blocks), ``"chunks"``
+                (contiguous 500-token windows for embedding), ``"html"`` (the
+                raw fetched HTML) or ``"links"`` (every http(s) link found).
+                The result populates the matching field; the others stay None.
             webhook_url: HTTPS URL to receive a signed POST when the job
                 finishes. Use :func:`wellmarked.verify_webhook` to verify
                 deliveries on the receiving side.
@@ -301,7 +313,7 @@ class WellMarked:
         url_list = list(urls)
         if not url_list:
             raise ValueError("bulk() requires at least one URL.")
-        payload: dict[str, object] = {"urls": url_list, "render_js": render_js}
+        payload: dict[str, object] = {"urls": url_list, "render_js": render_js, "format": format}
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
@@ -385,6 +397,7 @@ class WellMarked:
         *,
         depth: int = 1,
         render_js: bool = False,
+        format: str = "markdown",
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
         idempotency_key: Optional[str] = None,
@@ -423,7 +436,7 @@ class WellMarked:
         if depth < 0:
             raise ValueError("depth must be >= 0.")
         payload: dict[str, object] = {
-            "url": url, "depth": depth, "render_js": render_js,
+            "url": url, "depth": depth, "render_js": render_js, "format": format,
         }
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url

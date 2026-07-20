@@ -25,6 +25,9 @@ from .errors import (
 from .models import (
     ApiKeyInfo,
     BulkItem,
+    Chunk,
+    ContentBlock,
+    ContentMetrics,
     BulkJob,
     CrawlItem,
     CrawlJob,
@@ -51,6 +54,9 @@ __all__ = [
     # Models
     "ApiKeyInfo",
     "BulkItem",
+    "Chunk",
+    "ContentBlock",
+    "ContentMetrics",
     "BulkJob",
     "CrawlItem",
     "CrawlJob",

@@ -841,8 +841,8 @@ async def test_async_custom_headers_passed_through() -> None:
 # ── Smoke: ExtractResult surfaces only documented attributes ──────────────────
 
 def test_extract_result_attributes_match_api_contract() -> None:
-    """ExtractResult should have exactly the three fields the API documents:
-    markdown, metadata, request_id — nothing else."""
+    """ExtractResult carries exactly the fields the API documents: the five
+    format-dependent content fields plus metrics, metadata and request_id."""
     result = ExtractResult.from_response(
         {
             "markdown": "x",
@@ -853,7 +853,13 @@ def test_extract_result_attributes_match_api_contract() -> None:
     # Dataclass fields are the source of truth.
     from dataclasses import fields
     field_names = {f.name for f in fields(result)}
-    assert field_names == {"markdown", "metadata", "request_id"}
+    assert field_names == {
+        "markdown", "blocks", "chunks", "html", "links", "metrics",
+        "metadata", "request_id",
+    }
+    # The default format still lands in `markdown`, unchanged.
+    assert result.markdown == "x"
+    assert result.blocks is None and result.chunks is None
 
 
 # ── Idempotency-Key ───────────────────────────────────────────────────────────
@@ -1348,3 +1354,135 @@ async def test_async_search_success() -> None:
         res = await wm.search("python asyncio")
     assert isinstance(res, SearchResults) and len(res.results) == 2
     assert res.results[0].ok and res.results[1].error == "target_timeout"
+
+
+# ── Output formats (Phase 4.5) ────────────────────────────────────────────────
+# The format param must reach the wire, and each format's payload must land in
+# its own field. A response whose content silently arrives as None would look
+# like a successful-but-empty extraction to the caller.
+
+@respx.mock
+def test_extract_sends_format_and_parses_blocks() -> None:
+    route = respx.post(f"{BASE_URL}/extract").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "blocks": [
+                    {"type": "heading", "text": "Title", "level": 1},
+                    {"type": "paragraph", "text": "Body text.", "level": None},
+                ],
+                "metrics": {
+                    "content_bytes": 8000, "input_tokens": 2000,
+                    "output_tokens": 500, "tokens_saved": 1500,
+                    "reduction_pct": 75.0,
+                },
+                "metadata": {"url": "https://example.com"},
+                "request_id": "id",
+            },
+        )
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        result = wm.extract("https://example.com", format="json")
+
+    assert _json.loads(route.calls[0].request.content)["format"] == "json"
+    assert result.markdown is None
+    assert [b.type for b in result.blocks] == ["heading", "paragraph"]
+    assert result.blocks[0].level == 1
+    assert result.blocks[1].level is None
+    assert result.metrics.tokens_saved == 1500
+    assert result.metrics.reduction_pct == 75.0
+    # `content` resolves whichever field came back.
+    assert result.content == result.blocks
+
+
+@respx.mock
+def test_extract_parses_chunks_with_offsets() -> None:
+    respx.post(f"{BASE_URL}/extract").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "chunks": [
+                    {"text": "first ", "start_token": 0, "end_token": 500},
+                    {"text": "second", "start_token": 500, "end_token": 812},
+                ],
+                "metadata": {"url": "https://example.com"},
+                "request_id": "id",
+            },
+        )
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        result = wm.extract("https://example.com", format="chunks")
+
+    assert [c.start_token for c in result.chunks] == [0, 500]
+    # Contiguity survives the SDK's parsing.
+    assert result.chunks[0].end_token == result.chunks[1].start_token
+
+
+@respx.mock
+def test_extract_defaults_to_markdown_on_the_wire() -> None:
+    """The default must be sent explicitly and still populate `markdown`, so
+    upgrading the SDK cannot change an existing caller's response."""
+    route = respx.post(f"{BASE_URL}/extract").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "markdown": "## Hello",
+                "metadata": {"url": "https://example.com"},
+                "request_id": "id",
+            },
+        )
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        result = wm.extract("https://example.com")
+
+    assert _json.loads(route.calls[0].request.content)["format"] == "markdown"
+    assert result.markdown == "## Hello"
+    assert result.content == "## Hello"
+
+
+@respx.mock
+def test_bulk_and_crawl_forward_format() -> None:
+    bulk_route = respx.post(f"{BASE_URL}/bulk").mock(
+        return_value=httpx.Response(200, json=_QUEUED_JOB)
+    )
+    crawl_route = respx.post(f"{BASE_URL}/crawl").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "job_id": "1c4f9a02-0000-0000-0000-000000000000",
+                "kind": "crawl", "status": "queued",
+                "total": 0, "completed": 0, "results": [],
+            },
+        )
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.bulk(["https://a.test"], format="links")
+        wm.crawl("https://b.test", format="html")
+
+    assert _json.loads(bulk_route.calls[0].request.content)["format"] == "links"
+    assert _json.loads(crawl_route.calls[0].request.content)["format"] == "html"
+
+
+def test_bulk_item_ok_is_true_for_non_markdown_formats() -> None:
+    """`ok` keys on `error`, not on `markdown`.
+
+    Negative control: keying it on `markdown is not None` (as it did before
+    formats existed) reports every successful links/html/chunks item as failed.
+    """
+    item = BulkItem.from_dict(
+        {"url": "https://a.test", "links": ["https://a.test/x"], "error": None}
+    )
+    assert item.ok is True
+    assert item.markdown is None
+    assert item.content == ["https://a.test/x"]
+
+    failed = BulkItem.from_dict({"url": "https://b.test", "error": "target_timeout"})
+    assert failed.ok is False
+    assert failed.content is None
+
+
+def test_metrics_absent_when_the_api_omits_them() -> None:
+    result = ExtractResult.from_response(
+        {"markdown": "x", "metadata": {"url": "https://e.test"}, "request_id": "i"}
+    )
+    assert result.metrics is None

@@ -67,18 +67,135 @@ class ExtractionMeta:
 
 
 @dataclass(frozen=True)
-class ExtractResult:
-    """Result of ``POST /extract``."""
-    markdown: str
-    metadata: ExtractionMeta
-    request_id: str
+class ContentBlock:
+    """One typed block of a ``format="json"`` document.
+
+    ``level`` is 1-6 for headings and ``None`` for every other type.
+    """
+    type: str              # "heading" | "paragraph" | "list" | "code"
+    text: str
+    level: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ContentBlock":
+        return cls(
+            type=str(data.get("type", "paragraph")),
+            text=str(data.get("text", "")),
+            level=data.get("level"),
+        )
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """One token window of a ``format="chunks"`` document.
+
+    Offsets index into the document's token stream and are contiguous —
+    ``chunks[i].end_token == chunks[i+1].start_token`` — so joining every
+    ``text`` reproduces exactly what ``format="markdown"`` would have returned.
+    Windows are 500 tokens except where that would bisect a multi-byte
+    character, in which case they run a token or two longer.
+    """
+    text: str
+    start_token: int
+    end_token: int
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Chunk":
+        return cls(
+            text=str(data.get("text", "")),
+            start_token=int(data.get("start_token", 0)),
+            end_token=int(data.get("end_token", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class ContentMetrics:
+    """How much the extraction reduced the page, in tokens.
+
+    ``tokens_saved`` is ``input_tokens - output_tokens``: what you did NOT have
+    to send a model versus feeding it the raw HTML. Every token field is
+    ``None`` if the API could not load its tokenizer — the extraction itself
+    still succeeds, the metrics just go unreported.
+    """
+    content_bytes: int = 0
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    tokens_saved: Optional[int] = None
+    reduction_pct: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ContentMetrics":
+        return cls(
+            content_bytes=int(data.get("content_bytes", 0)),
+            input_tokens=data.get("input_tokens"),
+            output_tokens=data.get("output_tokens"),
+            tokens_saved=data.get("tokens_saved"),
+            reduction_pct=data.get("reduction_pct"),
+        )
+
+
+@dataclass(frozen=True)
+class _Content:
+    """The format-dependent content fields shared by every extraction result.
+
+    Exactly one of ``markdown``/``blocks``/``chunks``/``html``/``links`` is
+    populated — whichever the request's ``format`` selected. ``markdown`` is the
+    default, so code written before formats existed keeps working unchanged.
+
+    Use :attr:`content` when you don't care which format came back.
+    """
+    markdown: Optional[str] = None
+    blocks: Optional[List[ContentBlock]] = None
+    chunks: Optional[List[Chunk]] = None
+    html: Optional[str] = None
+    links: Optional[List[str]] = None
+    metrics: Optional[ContentMetrics] = None
+
+    @property
+    def content(self) -> Any:
+        """Whichever content field the response actually populated, or None.
+
+        Typed ``Any`` because the concrete type depends on the request's
+        ``format``: ``str`` for markdown/html, a list for blocks/chunks/links.
+        Read the specific field instead when you need a precise static type.
+        """
+        for value in (self.markdown, self.blocks, self.chunks, self.html, self.links):
+            if value is not None:
+                return value
+        return None
+
+
+def _content_kwargs(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Parse the shared content fields out of any extraction-shaped payload."""
+    raw_blocks = body.get("blocks")
+    raw_chunks = body.get("chunks")
+    raw_metrics = body.get("metrics")
+    return dict(
+        markdown=body.get("markdown"),
+        blocks=[ContentBlock.from_dict(b) for b in raw_blocks] if raw_blocks is not None else None,
+        chunks=[Chunk.from_dict(c) for c in raw_chunks] if raw_chunks is not None else None,
+        html=body.get("html"),
+        links=body.get("links"),
+        metrics=ContentMetrics.from_dict(raw_metrics) if raw_metrics is not None else None,
+    )
+
+
+@dataclass(frozen=True)
+class ExtractResult(_Content):
+    """Result of ``POST /extract``.
+
+    ``markdown`` is populated for the default ``format="markdown"``; other
+    formats populate their own field instead (see :class:`_Content`).
+    """
+    metadata: ExtractionMeta = None  # type: ignore[assignment]
+    request_id: str = ""
 
     @classmethod
     def from_response(cls, body: Mapping[str, Any]) -> "ExtractResult":
         return cls(
-            markdown=str(body.get("markdown", "")),
             metadata=ExtractionMeta.from_dict(body.get("metadata", dict())),
             request_id=str(body.get("request_id", "")),
+            **_content_kwargs(body),
         )
 
 
@@ -141,32 +258,34 @@ class SearchResults:
 # ── Bulk ──────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
-class BulkItem:
+class BulkItem(_Content):
     """One entry in a bulk job's ``results`` list.
 
-    On success, ``markdown`` and ``metadata`` are populated and ``error`` is
-    ``None``. On a per-URL failure, ``markdown``/``metadata`` are ``None`` and
-    ``error`` carries a stable API error **code** — never a human message — e.g.
-    ``target_timeout``, ``domain_denied``, ``internal_error``. Same convention
-    as :class:`CrawlItem.error`, so results parse identically on either endpoint.
+    On success the format's content field (``markdown`` by default) and
+    ``metadata`` are populated and ``error`` is ``None``. On a per-URL failure,
+    the content fields and ``metadata`` are ``None`` and ``error`` carries a
+    stable API error **code** — never a human message — e.g. ``target_timeout``,
+    ``domain_denied``, ``internal_error``. Same convention as
+    :class:`CrawlItem.error`, so results parse identically on either endpoint.
     """
-    url: str
-    markdown: Optional[str] = None
+    url: str = ""
     metadata: Optional[ExtractionMeta] = None
     error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
-        return self.error is None and self.markdown is not None
+        # Keyed on `error`, not on `markdown`: a non-markdown format leaves
+        # markdown None on a perfectly successful item.
+        return self.error is None and self.content is not None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BulkItem":
         raw_meta = data.get("metadata")
         return cls(
             url=str(data.get("url", "")),
-            markdown=data.get("markdown"),
             metadata=ExtractionMeta.from_dict(raw_meta) if raw_meta is not None else None,
             error=data.get("error"),
+            **_content_kwargs(data),
         )
 
 
@@ -224,21 +343,20 @@ class BulkJob:
 # ── Crawl ─────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
-class CrawlItem:
+class CrawlItem(_Content):
     """One page in a crawl job's ``results`` list.
 
     Shape mirrors :class:`BulkItem` with an added ``depth`` field showing how
     far from the root URL this page sits in the BFS.
     """
-    url: str
+    url: str = ""
     depth: int = 0
-    markdown: Optional[str] = None
     metadata: Optional[ExtractionMeta] = None
     error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
-        return self.error is None and self.markdown is not None
+        return self.error is None and self.content is not None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CrawlItem":
@@ -246,9 +364,9 @@ class CrawlItem:
         return cls(
             url=str(data.get("url", "")),
             depth=int(data.get("depth", 0)),
-            markdown=data.get("markdown"),
             metadata=ExtractionMeta.from_dict(raw_meta) if raw_meta is not None else None,
             error=data.get("error"),
+            **_content_kwargs(data),
         )
 
 

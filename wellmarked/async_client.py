@@ -122,12 +122,13 @@ class AsyncWellMarked:
         url: str,
         *,
         render_js: bool = False,
+        format: str = "markdown",
         allow_domains: Optional[Iterable[str]] = None,
         deny_patterns: Optional[Iterable[str]] = None,
         respect_robots: Optional[str] = None,
     ) -> ExtractResult:
         """Extract clean Markdown from a single URL. See :meth:`WellMarked.extract`."""
-        payload: dict[str, object] = {"url": url, "render_js": render_js}
+        payload: dict[str, object] = {"url": url, "render_js": render_js, "format": format}
         payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
         body = await self._request("POST", "/extract", json=payload)
         return ExtractResult.from_response(body)
@@ -150,6 +151,7 @@ class AsyncWellMarked:
         urls: Iterable[str],
         *,
         render_js: bool = False,
+        format: str = "markdown",
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
         idempotency_key: Optional[str] = None,
@@ -161,7 +163,7 @@ class AsyncWellMarked:
         url_list = list(urls)
         if not url_list:
             raise ValueError("bulk() requires at least one URL.")
-        payload: dict[str, object] = {"urls": url_list, "render_js": render_js}
+        payload: dict[str, object] = {"urls": url_list, "render_js": render_js, "format": format}
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
@@ -217,6 +219,7 @@ class AsyncWellMarked:
         *,
         depth: int = 1,
         render_js: bool = False,
+        format: str = "markdown",
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
         idempotency_key: Optional[str] = None,
@@ -228,7 +231,7 @@ class AsyncWellMarked:
         if depth < 0:
             raise ValueError("depth must be >= 0.")
         payload: dict[str, object] = {
-            "url": url, "depth": depth, "render_js": render_js,
+            "url": url, "depth": depth, "render_js": render_js, "format": format,
         }
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
