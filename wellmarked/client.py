@@ -48,10 +48,8 @@ class WellMarked:
         self,
         api_key: Optional[str] = None,
         *,
-        base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        http_client: Optional[httpx.Client] = None,
         headers: Optional[dict[str, str]] = None,
     ) -> None:
         """Create a sync client.
@@ -59,7 +57,6 @@ class WellMarked:
         Args:
             api_key: Your WellMarked API key (``wm_...``). Falls back to the
                 ``WELLMARKED_API_KEY`` environment variable.
-            base_url: API base URL. Override for testing.
             timeout: Timeout for a single attempt, seconds. This is **per
                 attempt, not per call**: with the default ``max_retries=2`` a
                 retryable request can take up to roughly ``timeout * 3`` plus
@@ -74,30 +71,21 @@ class WellMarked:
                 arrival, and a connection error can't tell you whether it
                 arrived. Retries reuse the same key, so the API replays the
                 original job rather than enqueuing a second one.
-            http_client: Bring your own ``httpx.Client`` (custom transport,
-                proxy, shared pool). The SDK won't close it on ``__exit__``
-                when you pass one.
             headers: Extra headers sent on every request — useful for adding
                 an internal correlation id, a custom user agent suffix, etc.
                 Authorization / Content-Type / Accept are reserved and silently
                 ignored if passed (the SDK manages those itself).
         """
         self._api_key = resolve_api_key(api_key)
-        self._base_url = base_url.rstrip("/")
+        self._base_url = DEFAULT_BASE_URL
         self._max_retries = max(0, max_retries)
         self._extra_headers: dict[str, str] = dict(headers or {})
         merged = merge_headers(self._api_key, self._extra_headers)
-        self._owns_client = http_client is None
-        self._client: httpx.Client = http_client or httpx.Client(
+        self._client: httpx.Client = httpx.Client(
             base_url=self._base_url,
             headers=merged,
             timeout=timeout,
         )
-        # When the caller supplies their own client, only patch the auth
-        # header (and any extras they asked us to add) — don't replace
-        # headers they may have set deliberately.
-        if not self._owns_client:
-            self._client.headers.update(merged)
 
     # ── Self-registration ─────────────────────────────────────────────────────
 
@@ -106,9 +94,7 @@ class WellMarked:
         cls,
         email: str,
         *,
-        base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
-        http_client: Optional[httpx.Client] = None,
     ) -> RegisteredAccount:
         """Self-register for a free, extract-only API key — no existing key needed.
 
@@ -130,9 +116,8 @@ class WellMarked:
                 account; ``service_unavailable`` (503) if the limiter backend is
                 momentarily down (retry shortly).
         """
-        url = f"{base_url.rstrip('/')}/register"
-        owns = http_client is None
-        client = http_client or httpx.Client(timeout=timeout)
+        url = f"{DEFAULT_BASE_URL}/register"
+        client = httpx.Client(timeout=timeout)
         try:
             try:
                 response = client.post(url, json={"email": email})
@@ -147,8 +132,7 @@ class WellMarked:
                 response.status_code, body, headers=dict(response.headers),
             )
         finally:
-            if owns:
-                client.close()
+            client.close()
         return RegisteredAccount.from_response(data)
 
     # ── Context manager ───────────────────────────────────────────────────────
@@ -160,13 +144,8 @@ class WellMarked:
         self.close()
 
     def close(self) -> None:
-        """Release the underlying connection pool.
-
-        Only closes the HTTP client if the SDK created it. If you passed your
-        own ``http_client``, you remain responsible for closing it.
-        """
-        if self._owns_client:
-            self._client.close()
+        """Release the underlying connection pool."""
+        self._client.close()
 
     # ── Endpoints ─────────────────────────────────────────────────────────────
 
@@ -568,8 +547,7 @@ class WellMarked:
         headers: Optional[dict[str, str]] = None,
     ) -> Any:
         # Build absolute URLs ourselves rather than relying on httpx's base_url
-        # join. That way a user-supplied http_client without a base_url still
-        # works — important when the caller wants a custom transport/proxy.
+        # join — one obvious place constructs every request URL.
         url = f"{self._base_url}{path}"
         extra = sanitize_headers(headers)
 

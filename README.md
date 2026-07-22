@@ -249,14 +249,13 @@ All inherit from `WellMarkedError`.
 ```python
 WellMarked(
     api_key="wm_...",                   # or set WELLMARKED_API_KEY
-    base_url="https://api.wellmarked.io",
     timeout=30.0,                       # seconds, per request
-    http_client=my_httpx_client,        # optional: bring your own httpx.Client
+    max_retries=2,                      # retries for safely replayable requests
     headers={"X-Trace-Id": "..."},      # optional: extra headers on every request
 )
 ```
 
-Passing your own `httpx.Client`/`httpx.AsyncClient` is useful for custom transports, proxies, or shared connection pools. When you do, the SDK won't close it on `__exit__` — you remain responsible for its lifecycle.
+The client always talks to `https://api.wellmarked.io`.
 
 ## For Agents
 

@@ -359,30 +359,23 @@ async def test_async_bulk_empty_list_raises_value_error() -> None:
             await wm.bulk([])
 
 
-# ── Regression: user-supplied http_client with no base_url still works ────────
+# ── The client has no escape hatches: no base_url, no http_client ─────────────
 
-@respx.mock
-def test_user_supplied_http_client_without_base_url() -> None:
-    """A user passing their own httpx.Client (e.g. for a custom transport)
-    shouldn't need to know to set base_url — the SDK builds absolute URLs."""
-    respx.post(f"{BASE_URL}/extract").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "markdown": "## Hi",
-                "metadata": {"url": "https://example.com"},
-                "request_id": "33333333-3333-3333-3333-333333333333",
-            },
-        )
-    )
-
-    user_client = httpx.Client()  # no base_url
+def test_client_exposes_no_base_url_or_transport_override() -> None:
+    """WellMarked only serves api.wellmarked.io. The client deliberately has no
+    base_url parameter and no bring-your-own-http_client seam — accepting
+    either would be the capability to point the SDK at a different host, which
+    is a product decision, not an omission. Negative control: passing them must
+    raise TypeError, and the constructed client must target the real API."""
+    with pytest.raises(TypeError):
+        WellMarked(api_key=API_KEY, base_url="http://localhost:8000")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        WellMarked(api_key=API_KEY, http_client=httpx.Client())  # type: ignore[call-arg]
+    wm = WellMarked(api_key=API_KEY)
     try:
-        wm = WellMarked(api_key=API_KEY, http_client=user_client)
-        result = wm.extract("https://example.com")
-        assert result.markdown == "## Hi"
+        assert wm._base_url == BASE_URL
     finally:
-        user_client.close()
+        wm.close()
 
 
 # ── Regression: 2xx with no JSON body raises a clear error ────────────────────
@@ -1261,7 +1254,7 @@ def test_register_returns_account() -> None:
             "scopes": ["extract"],
         })
     )
-    account = WellMarked.register("agent@example.com", base_url=BASE_URL)
+    account = WellMarked.register("agent@example.com")
     assert isinstance(account, RegisteredAccount)
     assert account.api_key.startswith("wm_")
     assert account.plan == "free" and account.scopes == ["extract"]
@@ -1280,7 +1273,7 @@ def test_register_rate_limited_raises() -> None:
         })
     )
     with pytest.raises(RateLimitError) as ei:
-        WellMarked.register("agent@example.com", base_url=BASE_URL)
+        WellMarked.register("agent@example.com")
     assert ei.value.code == "register_rate_limited"
 
 
@@ -1293,7 +1286,7 @@ async def test_async_register() -> None:
             "plan": "free", "scopes": ["extract"],
         })
     )
-    account = await AsyncWellMarked.register("agent@example.com", base_url=BASE_URL)
+    account = await AsyncWellMarked.register("agent@example.com")
     assert account.user_id == "u2" and account.scopes == ["extract"]
 
 

@@ -45,28 +45,23 @@ class AsyncWellMarked:
         self,
         api_key: Optional[str] = None,
         *,
-        base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        http_client: Optional[httpx.AsyncClient] = None,
         headers: Optional[dict[str, str]] = None,
     ) -> None:
         """Async equivalent of :class:`wellmarked.WellMarked`. See its docstring
         for the full parameter description, including ``headers`` and
         ``max_retries``."""
         self._api_key = resolve_api_key(api_key)
-        self._base_url = base_url.rstrip("/")
+        self._base_url = DEFAULT_BASE_URL
         self._max_retries = max(0, max_retries)
         self._extra_headers: dict[str, str] = dict(headers or {})
         merged = merge_headers(self._api_key, self._extra_headers)
-        self._owns_client = http_client is None
-        self._client: httpx.AsyncClient = http_client or httpx.AsyncClient(
+        self._client: httpx.AsyncClient = httpx.AsyncClient(
             base_url=self._base_url,
             headers=merged,
             timeout=timeout,
         )
-        if not self._owns_client:
-            self._client.headers.update(merged)
 
     # ── Self-registration ─────────────────────────────────────────────────────
 
@@ -75,15 +70,12 @@ class AsyncWellMarked:
         cls,
         email: str,
         *,
-        base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
-        http_client: Optional[httpx.AsyncClient] = None,
     ) -> RegisteredAccount:
         """Self-register for a free, extract-only API key. See
         :meth:`WellMarked.register`. Not retried (registration isn't idempotent)."""
-        url = f"{base_url.rstrip('/')}/register"
-        owns = http_client is None
-        client = http_client or httpx.AsyncClient(timeout=timeout)
+        url = f"{DEFAULT_BASE_URL}/register"
+        client = httpx.AsyncClient(timeout=timeout)
         try:
             try:
                 response = await client.post(url, json={"email": email})
@@ -98,8 +90,7 @@ class AsyncWellMarked:
                 response.status_code, body, headers=dict(response.headers),
             )
         finally:
-            if owns:
-                await client.aclose()
+            await client.aclose()
         return RegisteredAccount.from_response(data)
 
     # ── Context manager ───────────────────────────────────────────────────────
@@ -112,8 +103,7 @@ class AsyncWellMarked:
 
     async def aclose(self) -> None:
         """Release the underlying connection pool. See :meth:`WellMarked.close`."""
-        if self._owns_client:
-            await self._client.aclose()
+        await self._client.aclose()
 
     # ── Endpoints ─────────────────────────────────────────────────────────────
 
