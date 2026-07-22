@@ -174,10 +174,11 @@ class WellMarked:
                 The result populates the matching field; the others stay None.
             retry: Server-side re-attempts on ``target_timeout``, each on a
                 fresh connection to the target. Default 0 (one attempt); no
-                upper bound — but each timed-out attempt takes 20-30s on this
-                synchronous call, so aggressive values belong on :meth:`bulk`.
-                Distinct from the client's own ``max_retries`` (transport
-                retries between you and the API).
+                upper bound on the value, though the server stops re-attempting
+                once a job's 6-hour lifetime is spent. Each timed-out attempt
+                takes 20-30s on this synchronous call, so aggressive values
+                belong on :meth:`bulk`. Distinct from the client's own
+                ``max_retries`` (transport retries between you and the API).
             allow_domains: Restrict this request to these domains (and their
                 subdomains). Can only narrow your key's own allowlist, never
                 widen it.
