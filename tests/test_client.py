@@ -1311,9 +1311,13 @@ def test_search_success() -> None:
     with WellMarked(api_key=API_KEY) as wm:
         res = wm.search("python asyncio", num_results=2)
 
-    # Request shape reached the server unchanged.
+    # Request shape reached the server unchanged (format defaults to markdown;
+    # policy overrides are omitted entirely when unset).
     sent = _json.loads(route.calls.last.request.content)
-    assert sent == {"query": "python asyncio", "num_results": 2, "render_js": False}
+    assert sent == {
+        "query": "python asyncio", "num_results": 2,
+        "render_js": False, "format": "markdown",
+    }
 
     assert isinstance(res, SearchResults) and res.query == "python asyncio"
     assert res.request_id == "33333333-3333-3333-3333-333333333333"
@@ -1322,6 +1326,39 @@ def test_search_success() -> None:
     assert isinstance(ok, SearchResult) and ok.ok and ok.markdown == "# A" and ok.title == "A"
     # A failed page still carries the provider snippet + a stable error code.
     assert not err.ok and err.error == "target_timeout" and err.snippet == "s2"
+
+
+@respx.mock
+def test_search_carries_the_full_extraction_parameter_set() -> None:
+    """search() takes format + the policy overrides, same as bulk/crawl, and a
+    non-markdown format lands in its own field on each result item."""
+    route = respx.post(f"{BASE_URL}/search").mock(
+        return_value=httpx.Response(200, json={
+            "query": "q",
+            "results": [{
+                "url": "https://a.test/", "status": "ok", "snippet": "s",
+                "chunks": [{"text": "hi", "start_token": 0, "end_token": 2}],
+            }],
+            "request_id": "33333333-3333-3333-3333-333333333333",
+        })
+    )
+
+    with WellMarked(api_key=API_KEY) as wm:
+        res = wm.search(
+            "q", format="chunks",
+            allow_domains=["a.test"], respect_robots="strict",
+        )
+
+    sent = _json.loads(route.calls.last.request.content)
+    assert sent["format"] == "chunks"
+    assert sent["allow_domains"] == ["a.test"]
+    assert sent["respect_robots"] == "strict"
+    assert "deny_patterns" not in sent          # unset overrides stay omitted
+
+    item = res.results[0]
+    assert item.ok and item.markdown is None
+    assert item.chunks is not None and item.chunks[0].text == "hi"
+    assert item.content == item.chunks          # the format-agnostic accessor
 
 
 @respx.mock

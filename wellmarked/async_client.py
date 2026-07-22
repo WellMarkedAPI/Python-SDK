@@ -129,10 +129,18 @@ class AsyncWellMarked:
         *,
         num_results: int = 5,
         render_js: bool = False,
+        format: str = "markdown",
+        allow_domains: Optional[Iterable[str]] = None,
+        deny_patterns: Optional[Iterable[str]] = None,
+        respect_robots: Optional[str] = None,
     ) -> SearchResults:
-        """Search the web and extract each result to Markdown. See
-        :meth:`WellMarked.search`."""
-        payload = {"query": query, "num_results": num_results, "render_js": render_js}
+        """Search the web and extract each result. See
+        :meth:`WellMarked.search` — takes the full extraction parameter set."""
+        payload: dict[str, object] = {
+            "query": query, "num_results": num_results,
+            "render_js": render_js, "format": format,
+        }
+        payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
         body = await self._request("POST", "/search", json=payload)
         return SearchResults.from_response(body)
 

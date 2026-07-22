@@ -198,20 +198,30 @@ class WellMarked:
         *,
         num_results: int = 5,
         render_js: bool = False,
+        format: str = "markdown",
+        allow_domains: Optional[Iterable[str]] = None,
+        deny_patterns: Optional[Iterable[str]] = None,
+        respect_robots: Optional[str] = None,
     ) -> SearchResults:
-        """Search the web and extract each result to Markdown. Synchronous.
+        """Search the web and extract each result. Synchronous.
 
         One round trip: the query runs against the search provider and the
         result pages are extracted concurrently, returned together with per-page
         ``status`` (a slow or blocked page becomes an error item, never sinks the
         call). Costs ``1 + len(results)`` requests — one for the query, one per
-        page returned.
+        page returned. Takes the full extraction parameter set — ``format`` and
+        the policy overrides apply to every extracted result, exactly as they
+        do on :meth:`bulk` and :meth:`crawl`.
 
         Args:
             query: The search query.
             num_results: How many results to fetch + extract. Clamped to 1..10
                 server-side (a search is one synchronous call, so it's capped).
             render_js: Use Playwright to render JS-heavy result pages.
+            format: Output format for every result — see :meth:`extract`.
+            allow_domains: Narrow-only compliance override — see :meth:`extract`.
+            deny_patterns: Narrow-only compliance override — see :meth:`extract`.
+            respect_robots: ``"strict"`` or ``"lax"`` — see :meth:`extract`.
 
         Raises:
             PermissionDeniedError: ``plan_not_supported`` — search requires a
@@ -220,7 +230,11 @@ class WellMarked:
             InternalServerError: The search provider is unconfigured or
                 unreachable — ``.code == "service_unavailable"`` (retryable).
         """
-        payload = {"query": query, "num_results": num_results, "render_js": render_js}
+        payload: dict[str, object] = {
+            "query": query, "num_results": num_results,
+            "render_js": render_js, "format": format,
+        }
+        payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
         body = self._request("POST", "/search", json=payload)
         return SearchResults.from_response(body)
 

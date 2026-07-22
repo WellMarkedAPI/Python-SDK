@@ -202,20 +202,20 @@ class ExtractResult(_Content):
 # ── Search ────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
-class SearchResult:
+class SearchResult(_Content):
     """One result in a :class:`SearchResults`.
 
-    On success ``status == "ok"`` and ``markdown`` is populated; on a per-page
-    failure ``status == "error"`` and ``error`` carries a stable code (same
-    convention as :class:`BulkItem.error`). ``title`` is the extracted title on
-    success, else the search provider's; ``snippet`` is always the provider's
-    result snippet, so a page that failed extraction still carries context.
+    On success ``status == "ok"`` and the request's format field (``markdown``
+    by default) is populated; on a per-page failure ``status == "error"`` and
+    ``error`` carries a stable code (same convention as
+    :class:`BulkItem.error`). ``title`` is the extracted title on success, else
+    the search provider's; ``snippet`` is always the provider's result snippet,
+    so a page that failed extraction still carries context.
     """
-    url: str
-    status: str            # "ok" | "error"
+    url: str = ""
+    status: str = "error"  # "ok" | "error"
     title: Optional[str] = None
     snippet: Optional[str] = None
-    markdown: Optional[str] = None
     error: Optional[str] = None
 
     @property
@@ -229,8 +229,8 @@ class SearchResult:
             status=str(data.get("status", "error")),
             title=data.get("title"),
             snippet=data.get("snippet"),
-            markdown=data.get("markdown"),
             error=data.get("error"),
+            **_content_kwargs(data),
         )
 
 
