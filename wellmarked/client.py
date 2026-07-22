@@ -155,6 +155,7 @@ class WellMarked:
         *,
         render_js: bool = False,
         format: str = "markdown",
+        retry: int = 0,
         allow_domains: Optional[Iterable[str]] = None,
         deny_patterns: Optional[Iterable[str]] = None,
         respect_robots: Optional[str] = None,
@@ -171,6 +172,12 @@ class WellMarked:
                 (contiguous 500-token windows for embedding), ``"html"`` (the
                 raw fetched HTML) or ``"links"`` (every http(s) link found).
                 The result populates the matching field; the others stay None.
+            retry: Server-side re-attempts on ``target_timeout``, each on a
+                fresh connection to the target. Default 0 (one attempt); no
+                upper bound — but each timed-out attempt takes 20-30s on this
+                synchronous call, so aggressive values belong on :meth:`bulk`.
+                Distinct from the client's own ``max_retries`` (transport
+                retries between you and the API).
             allow_domains: Restrict this request to these domains (and their
                 subdomains). Can only narrow your key's own allowlist, never
                 widen it.
@@ -187,7 +194,9 @@ class WellMarked:
             UnprocessableEntityError: ``no_content`` or ``target_timeout``.
             AuthenticationError: Missing or invalid API key.
         """
-        payload: dict[str, object] = {"url": url, "render_js": render_js, "format": format}
+        payload: dict[str, object] = {
+            "url": url, "render_js": render_js, "format": format, "retry": retry,
+        }
         payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
         body = self._request("POST", "/extract", json=payload)
         return ExtractResult.from_response(body)
@@ -244,6 +253,7 @@ class WellMarked:
         *,
         render_js: bool = False,
         format: str = "markdown",
+        retry: int = 0,
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
         idempotency_key: Optional[str] = None,
@@ -269,6 +279,9 @@ class WellMarked:
                 (contiguous 500-token windows for embedding), ``"html"`` (the
                 raw fetched HTML) or ``"links"`` (every http(s) link found).
                 The result populates the matching field; the others stay None.
+            retry: Per-URL server-side re-attempts on ``target_timeout`` —
+                see :meth:`extract`. The async workers absorb the retry time,
+                so this is the natural home for aggressive values.
             webhook_url: HTTPS URL to receive a signed POST when the job
                 finishes. Use :func:`wellmarked.verify_webhook` to verify
                 deliveries on the receiving side.
@@ -306,7 +319,9 @@ class WellMarked:
         url_list = list(urls)
         if not url_list:
             raise ValueError("bulk() requires at least one URL.")
-        payload: dict[str, object] = {"urls": url_list, "render_js": render_js, "format": format}
+        payload: dict[str, object] = {
+            "urls": url_list, "render_js": render_js, "format": format, "retry": retry,
+        }
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
@@ -391,6 +406,8 @@ class WellMarked:
         depth: int = 1,
         render_js: bool = False,
         format: str = "markdown",
+        retry: int = 0,
+        max_pages: Optional[int] = None,
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
         idempotency_key: Optional[str] = None,
@@ -416,10 +433,13 @@ class WellMarked:
             * Enterprise → unlimited depth and pages
 
         See :meth:`bulk` for the meaning of ``webhook_url``,
-        ``webhook_include_results``, and ``idempotency_key``. The compliance
-        overrides ``allow_domains`` / ``deny_patterns`` / ``respect_robots``
-        work as in :meth:`extract`; as with bulk, a per-page policy denial
-        surfaces in ``results[].error`` rather than raising.
+        ``webhook_include_results``, ``idempotency_key``, and ``retry``
+        (per-page timeout re-attempts). ``max_pages`` caps how many pages
+        this crawl may bill — it can only narrow your plan's page cap, never
+        widen it. The compliance overrides ``allow_domains`` /
+        ``deny_patterns`` / ``respect_robots`` work as in :meth:`extract`;
+        as with bulk, a per-page policy denial surfaces in
+        ``results[].error`` rather than raising.
 
         Raises:
             PermissionDeniedError: ``plan_not_supported`` (Free tier).
@@ -430,7 +450,10 @@ class WellMarked:
             raise ValueError("depth must be >= 0.")
         payload: dict[str, object] = {
             "url": url, "depth": depth, "render_js": render_js, "format": format,
+            "retry": retry,
         }
+        if max_pages is not None:
+            payload["max_pages"] = max_pages
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results

@@ -1,6 +1,7 @@
 """Mocked-transport tests for the sync and async clients."""
 from __future__ import annotations
 
+import inspect
 import json as _json
 
 import httpx
@@ -1491,6 +1492,58 @@ def test_bulk_and_crawl_forward_format() -> None:
 
     assert _json.loads(bulk_route.calls[0].request.content)["format"] == "links"
     assert _json.loads(crawl_route.calls[0].request.content)["format"] == "html"
+
+
+@respx.mock
+def test_retry_is_sent_on_extract_bulk_and_crawl_but_not_search() -> None:
+    """`retry` (server-side timeout re-attempts) rides every extraction
+    endpoint except /search — its 15s per-hit deadline can't absorb one, so
+    the SDK must not offer it there. Defaults to 0 like the API."""
+    extract_route = respx.post(f"{BASE_URL}/extract").mock(
+        return_value=httpx.Response(200, json={
+            "markdown": "# ok",
+            "metadata": {"url": "https://a.test",
+                         "retrieved_at": "2026-07-22T00:00:00Z"},
+        })
+    )
+    bulk_route = respx.post(f"{BASE_URL}/bulk").mock(
+        return_value=httpx.Response(200, json=_QUEUED_JOB)
+    )
+    crawl_route = respx.post(f"{BASE_URL}/crawl").mock(
+        return_value=httpx.Response(200, json={
+            "job_id": "1c4f9a02-0000-0000-0000-000000000000",
+            "kind": "crawl", "status": "queued",
+            "total": 0, "completed": 0, "results": [],
+        })
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.extract("https://a.test")                       # default
+        wm.extract("https://a.test", retry=3)
+        wm.bulk(["https://a.test"], retry=2)
+        wm.crawl("https://b.test", retry=1, max_pages=50)
+        assert "retry" not in inspect.signature(wm.search).parameters
+
+    assert _json.loads(extract_route.calls[0].request.content)["retry"] == 0
+    assert _json.loads(extract_route.calls[1].request.content)["retry"] == 3
+    assert _json.loads(bulk_route.calls[0].request.content)["retry"] == 2
+    crawl_sent = _json.loads(crawl_route.calls[0].request.content)
+    assert crawl_sent["retry"] == 1
+    assert crawl_sent["max_pages"] == 50
+
+
+@respx.mock
+def test_crawl_omits_max_pages_when_unset() -> None:
+    """None must not serialize — the plan's own cap should stand untouched."""
+    route = respx.post(f"{BASE_URL}/crawl").mock(
+        return_value=httpx.Response(200, json={
+            "job_id": "1c4f9a02-0000-0000-0000-000000000000",
+            "kind": "crawl", "status": "queued",
+            "total": 0, "completed": 0, "results": [],
+        })
+    )
+    with WellMarked(api_key=API_KEY) as wm:
+        wm.crawl("https://b.test")
+    assert "max_pages" not in _json.loads(route.calls[0].request.content)
 
 
 def test_bulk_item_ok_is_true_for_non_markdown_formats() -> None:

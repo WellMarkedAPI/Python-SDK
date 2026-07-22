@@ -113,12 +113,15 @@ class AsyncWellMarked:
         *,
         render_js: bool = False,
         format: str = "markdown",
+        retry: int = 0,
         allow_domains: Optional[Iterable[str]] = None,
         deny_patterns: Optional[Iterable[str]] = None,
         respect_robots: Optional[str] = None,
     ) -> ExtractResult:
         """Extract clean Markdown from a single URL. See :meth:`WellMarked.extract`."""
-        payload: dict[str, object] = {"url": url, "render_js": render_js, "format": format}
+        payload: dict[str, object] = {
+            "url": url, "render_js": render_js, "format": format, "retry": retry,
+        }
         payload.update(policy_overrides(allow_domains, deny_patterns, respect_robots))
         body = await self._request("POST", "/extract", json=payload)
         return ExtractResult.from_response(body)
@@ -150,6 +153,7 @@ class AsyncWellMarked:
         *,
         render_js: bool = False,
         format: str = "markdown",
+        retry: int = 0,
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
         idempotency_key: Optional[str] = None,
@@ -161,7 +165,9 @@ class AsyncWellMarked:
         url_list = list(urls)
         if not url_list:
             raise ValueError("bulk() requires at least one URL.")
-        payload: dict[str, object] = {"urls": url_list, "render_js": render_js, "format": format}
+        payload: dict[str, object] = {
+            "urls": url_list, "render_js": render_js, "format": format, "retry": retry,
+        }
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
@@ -218,6 +224,8 @@ class AsyncWellMarked:
         depth: int = 1,
         render_js: bool = False,
         format: str = "markdown",
+        retry: int = 0,
+        max_pages: Optional[int] = None,
         webhook_url: Optional[str] = None,
         webhook_include_results: bool = False,
         idempotency_key: Optional[str] = None,
@@ -230,7 +238,10 @@ class AsyncWellMarked:
             raise ValueError("depth must be >= 0.")
         payload: dict[str, object] = {
             "url": url, "depth": depth, "render_js": render_js, "format": format,
+            "retry": retry,
         }
+        if max_pages is not None:
+            payload["max_pages"] = max_pages
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
             payload["webhook_include_results"] = webhook_include_results
