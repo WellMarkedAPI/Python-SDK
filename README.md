@@ -76,6 +76,8 @@ for item in job.results:
         print(f"{item.url} failed: {item.error}")
 ```
 
+Pass `retry=N` to any of `extract`, `bulk`, or `crawl` to re-attempt timed-out fetches server-side (`target_timeout` only, fresh connection per attempt, default 0). On the synchronous `extract` each timed-out attempt takes 20–30s before the next fires, so aggressive values belong here on `bulk`, where the async workers absorb the wait. `search` doesn't take `retry` — its 15-second per-result deadline can't absorb one.
+
 `get_job` and `wait_for_job` are **polymorphic** — they work for both bulk and crawl `job_id`s. The SDK reads a `kind` discriminator from the API response and returns either a `BulkJob` or a `CrawlJob`. Use `isinstance(job, CrawlJob)` (or check `job.kind == "crawl"`) before reading crawl-specific fields like `job.truncated` or `item.depth`.
 
 ## Crawl
@@ -96,7 +98,7 @@ if job.truncated:
     print(f"crawl stopped early: {job.truncated_reason}")
 ```
 
-Each successful page consumes one request from your monthly quota — failed pages (timeouts, robots-disallowed, no-content) are not billed. If you run out of quota mid-crawl the job finishes with `truncated=True`, `truncated_reason="quota_exhausted"`.
+Pass `max_pages=N` to stop the crawl after N successful pages — it can only narrow your plan's page cap, never widen it. Each successful page consumes one request from your monthly quota — failed pages (timeouts, robots-disallowed, no-content) are not billed. If you run out of quota mid-crawl the job finishes with `truncated=True`, `truncated_reason="quota_exhausted"`.
 
 ## Webhooks
 
@@ -228,7 +230,7 @@ with WellMarked() as wm:
     except RateLimitError as e:
         print(f"Quota hit. Resets in {e.retry_after}s.")
     except UnprocessableEntityError as e:
-        # e.code is one of: no_content, target_timeout, js_rendering_disabled, ...
+        # e.code is one of: no_content, target_timeout, ...
         print(f"Extraction failed ({e.code}): {e.message}")
 ```
 
@@ -237,7 +239,7 @@ with WellMarked() as wm:
 | `AuthenticationError`      | 401  | `missing_api_key`, `invalid_api_key`                                         |
 | `PermissionDeniedError`    | 403  | `account_inactive`, `plan_not_supported`, `forbidden`                        |
 | `NotFoundError`            | 404  | `job_not_found`                                                              |
-| `UnprocessableEntityError` | 422  | `no_content`, `target_timeout`, `js_rendering_disabled`, `bulk_cap_exceeded`, `crawl_depth_exceeded` |
+| `UnprocessableEntityError` | 422  | `no_content`, `target_timeout`, `bulk_cap_exceeded`, `crawl_depth_exceeded`                          |
 | `RateLimitError`           | 429  | `rate_limit_too_fast` *(per-second cap; `retry_after_ms` carries the sub-second back-off)* · `rate_limit_exceeded` *(monthly quota; `retry_after` in seconds)* |
 | `InternalServerError`      | 5xx  | —                                                                            |
 | `APIConnectionError`       | —    | DNS / TCP / TLS / timeout failures, raised before any HTTP round-trip        |
@@ -249,14 +251,13 @@ All inherit from `WellMarkedError`.
 ```python
 WellMarked(
     api_key="wm_...",                   # or set WELLMARKED_API_KEY
-    base_url="https://api.wellmarked.io",
     timeout=30.0,                       # seconds, per request
-    http_client=my_httpx_client,        # optional: bring your own httpx.Client
+    max_retries=2,                      # retries for safely replayable requests
     headers={"X-Trace-Id": "..."},      # optional: extra headers on every request
 )
 ```
 
-Passing your own `httpx.Client`/`httpx.AsyncClient` is useful for custom transports, proxies, or shared connection pools. When you do, the SDK won't close it on `__exit__` — you remain responsible for its lifecycle.
+The client always talks to `https://api.wellmarked.io`.
 
 ## For Agents
 
