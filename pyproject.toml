@@ -73,3 +73,12 @@ files = ["wellmarked"]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+
+[tool.ruff.lint]
+# Pin ruff's classic default rule set (pyflakes + the pycodestyle subset).
+# CI installs ruff unpinned, so without an explicit selection `ruff check`
+# follows whatever the *current* ruff release defaults to — and newer releases
+# broadened those defaults (pyupgrade/simplify/isort/ruff-native), which turns
+# CI red on unchanged code. Adopting those rule families is a deliberate,
+# separate migration, not an accident of an upstream release.
+select = ["E4", "E7", "E9", "F"]

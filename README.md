@@ -25,20 +25,22 @@ with WellMarked(api_key="wm_...") as wm:
 
 The API key can also be picked up from the `WELLMARKED_API_KEY` environment variable, in which case `WellMarked()` is enough.
 
-Get a key at [wellmarked.io](https://wellmarked.io).
+Get a key at [wellmarked.io](https://wellmarked.io) — or [self-register](#self-registration) with an email.
 
 ## Pricing
 
 |                       | Free      | Pro                  | Growth               | Enterprise    |
 |-----------------------|-----------|----------------------|----------------------|---------------|
 | **Monthly Price**     | $0        | $29/mo               | $79/mo               | $199/mo       |
-| **Annual Price**      | —         | $299/yr              | $799/yr              | $1,999/yr     |
 | **Included Requests** | 1,000/mo  | 10,000/mo            | 40,000/mo            | 250,000/mo    |
-| **Bulk Requests**     | ❌         | ✅ (up to 50/request) | ✅ (up to 200/request) | ✅ (Unlimited) |
+| **Annual Price**      | —         | $299/yr              | $799/yr              | $1,999/yr     |
+| **Bulk Requests**     | ✅ (up to 5/request) | ✅ (up to 50/request) | ✅ (up to 200/request) | ✅ (Unlimited) |
+| **Search**            | ❌         | ✅                    | ✅                    | ✅             |
 | **Crawl**             | ❌         | ✅ (2,000 pages/job)  | ✅ (10,000 pages/job) | ✅ (Unlimited) |
+| **`json`/`chunks` formats** | ❌  | ✅                    | ✅                    | ✅             |
 | **Overage Rate**      | —         | $0.0035/req          | $0.0020/req          | $0.0012/req   |
 | **JS Rendering**      | ❌         | ✅                    | ✅                    | ✅             |
-| **Priority Queue**    | Standard  | High                 | High                 | Highest       |
+| **Priority Queue**    | Last      | Standard             | High                 | Highest       |
 
 See additional pricing information at [wellmarked.io/#pricing](https://wellmarked.io/#pricing).
 
@@ -58,9 +60,49 @@ async def main():
 asyncio.run(main())
 ```
 
+## Output formats
+
+`extract`, `search`, `bulk`, and `crawl` all take a `format` argument. Exactly one content field is populated per result; the rest stay `None`. `.content` returns whichever one came back.
+
+```python
+r = wm.extract("https://example.com/article", format="chunks")
+for chunk in r.chunks:                       # ready-to-embed token windows
+    print(chunk.start_token, chunk.end_token, chunk.text[:40])
+
+wm.extract(url, format="json").blocks        # typed heading/paragraph/list/code blocks
+wm.extract(url, format="html").html          # cleaned main-content HTML
+wm.extract(url, format="links").links        # every http(s) link in the content
+wm.extract(url).content                      # whichever field the format populated
+```
+
+| `format`     | Field      | Plan  |
+|--------------|------------|-------|
+| `"markdown"` | `.markdown`| All   |
+| `"html"`     | `.html`    | All   |
+| `"links"`    | `.links`   | All   |
+| `"json"`     | `.blocks`  | Pro+  |
+| `"chunks"`   | `.chunks`  | Pro+  |
+
+Every extraction result also carries `.metrics` (`content_bytes`, `input_tokens`, `output_tokens`, `tokens_saved`, `reduction_pct`) — the token-savings ROI of the extraction, or `None` when the tokenizer is unavailable.
+
+## Search
+
+Search the web and extract every result in one synchronous call (Pro plan and above). Costs `1 + len(results)` requests. Results come back partial — a slow or blocked page is an error item, never sinks the call.
+
+```python
+results = wm.search("retrieval augmented generation", num_results=5)
+for hit in results.results:
+    if hit.ok:
+        print(hit.title, "→", hit.markdown[:80])
+    else:
+        print(f"{hit.url} failed: {hit.error}  (snippet: {hit.snippet})")
+```
+
+`num_results` is clamped to 1..10 server-side. `search` takes the full extraction parameter set — `format` and the [compliance overrides](#compliance-overrides) apply to every result. (It does not take `retry`; its per-result deadline can't absorb one.)
+
 ## Bulk extraction
 
-Submit many URLs at once (Pro: up to 50; Growth: up to 200; Enterprise: unlimited). The call returns immediately with a `job_id`. Poll with `get_job` or block until done with `wait_for_job`.
+Submit many URLs at once (Free: up to 5; Pro: up to 50; Growth: up to 200; Enterprise: unlimited). The call returns immediately with a `job_id`. Poll with `get_job` or block until done with `wait_for_job`.
 
 ```python
 job = wm.bulk([
@@ -76,16 +118,16 @@ for item in job.results:
         print(f"{item.url} failed: {item.error}")
 ```
 
-Pass `retry=N` to any of `extract`, `bulk`, or `crawl` to re-attempt timed-out fetches server-side (`target_timeout` only, fresh connection per attempt, default 0). On the synchronous `extract` each timed-out attempt takes 20–30s before the next fires, so aggressive values belong here on `bulk`, where the async workers absorb the wait. `search` doesn't take `retry` — its 15-second per-result deadline can't absorb one.
-
 `get_job` and `wait_for_job` are **polymorphic** — they work for both bulk and crawl `job_id`s. The SDK reads a `kind` discriminator from the API response and returns either a `BulkJob` or a `CrawlJob`. Use `isinstance(job, CrawlJob)` (or check `job.kind == "crawl"`) before reading crawl-specific fields like `job.truncated` or `item.depth`.
+
+Bulk submissions carry an automatically generated `Idempotency-Key` (see [Retries & idempotency](#retries--idempotency)), so an internal retry replays the original job rather than enqueuing a second one.
 
 ## Crawl
 
 Crawl a site BFS-style from a root URL — same-site links only, with per-plan depth and page caps (Pro: depth 5, up to 2,000 pages; Growth: depth 10, up to 10,000 pages; Enterprise: unlimited). Like `bulk`, this returns a queued job; poll with `get_job` or block until done with `wait_for_job` — the same two functions work on both kinds. Pass `render_js=True` to fetch each page through Playwright instead of httpx; a single shared browser is launched at the start of the crawl and reused across pages.
 
 ```python
-job = wm.crawl("https://docs.example.com", depth=2)
+job = wm.crawl("https://docs.example.com", depth=2, max_pages=500)
 job = wm.wait_for_job(job.job_id)          # works for crawl AND bulk job ids
 
 for page in job.results:
@@ -98,7 +140,73 @@ if job.truncated:
     print(f"crawl stopped early: {job.truncated_reason}")
 ```
 
-Pass `max_pages=N` to stop the crawl after N successful pages — it can only narrow your plan's page cap, never widen it. Each successful page consumes one request from your monthly quota — failed pages (timeouts, robots-disallowed, no-content) are not billed. If you run out of quota mid-crawl the job finishes with `truncated=True`, `truncated_reason="quota_exhausted"`.
+`max_pages` caps how many pages this crawl may bill — it can only narrow your plan's page cap, never widen it. Each successful page consumes one request from your monthly quota — failed pages (timeouts, robots-disallowed, no-content) are not billed. If you run out of quota mid-crawl the job finishes with `truncated=True`, `truncated_reason="quota_exhausted"`.
+
+## Retries on timeout
+
+`extract`, `bulk`, and `crawl` take a `retry` argument — server-side re-attempts when the *target* URL times out (`target_timeout`), each on a fresh connection. Default `0` (one attempt); no upper bound, though the server stops re-attempting once a job's 6-hour lifetime is spent.
+
+```python
+wm.extract("https://slow.example.com", retry=2)     # up to 3 fetch attempts
+wm.bulk(urls, retry=5)                               # async workers absorb the wait
+```
+
+On the synchronous `extract` each timed-out attempt takes 20–30s, so aggressive values belong on `bulk`/`crawl`. This is distinct from the client's own transport `max_retries` (see [Retries & idempotency](#retries--idempotency)).
+
+## Compliance overrides
+
+`extract`, `search`, `bulk`, and `crawl` accept three narrow-only overrides on your key's compliance policy — they can tighten it for a single request but never loosen it:
+
+```python
+wm.extract(
+    "https://example.com/article",
+    allow_domains=["example.com"],        # subset of what the key already allows
+    deny_patterns=["*/private/*"],        # added to the key's deny list
+    respect_robots="strict",              # can upgrade to strict, never down to lax
+)
+```
+
+On `extract` a policy denial raises `PermissionDeniedError` (`domain_not_allowed` / `domain_denied` / `robots_disallowed`); on `bulk`/`crawl` it surfaces as a per-item `error` instead.
+
+## Self-registration
+
+Get a free, extract-only key from an email — no existing key needed. The zero-to-first-call path for an agent that discovered WellMarked programmatically.
+
+```python
+account = WellMarked.register("agent@example.com")
+with WellMarked(api_key=account.api_key) as wm:      # Free plan, scopes=["extract"]
+    print(wm.extract("https://example.com").markdown)
+```
+
+The key is deliberately weak (Free plan, extract only, no billing). To unlock bulk, crawl, search, or paid quota, a human claims the account on [wellmarked.io](https://wellmarked.io).
+
+## Scoped keys
+
+Mint and manage additional keys programmatically (requires a calling key with the `keys` scope). A key can only grant scopes it holds.
+
+```python
+created = wm.create_key(["extract", "bulk"], name="ci-pipeline")
+print(created.api_key)                     # shown once — store it
+
+for k in wm.list_keys():                    # metadata only, never raw values
+    print(k.id, k.name, k.scopes, k.revoked_at)
+
+wm.revoke_key(created.id)                    # stops authenticating immediately
+```
+
+Scope vocabulary: `extract`, `bulk`, `crawl`, `search`, `keys`.
+
+## Audit log
+
+`get_logs()` returns your own request history, newest first — which key ran each call and how its compliance policy decided.
+
+```python
+page = wm.get_logs(limit=50, offset=0)
+for entry in page.logs:
+    print(entry.timestamp, entry.status_code, entry.target_url, entry.policy_decision)
+if page.has_more:
+    ...                                      # fetch offset += limit
+```
 
 ## Webhooks
 
@@ -209,6 +317,16 @@ print("New key:", rotated.api_key)  # shown once — store it before the program
 
 After `rotate_key()` the client automatically switches to the new key for subsequent calls; you still need to persist `rotated.api_key` somewhere durable, because the previous key stops working immediately and there is no recovery flow.
 
+## Retries & idempotency
+
+The client retries requests it knows are safe to replay — connection failures and 5xx, and only for GETs and POSTs carrying an `Idempotency-Key`. `bulk()` and `crawl()` send one automatically and reuse it across the SDK's internal retries, so a connection blip replays the original job rather than enqueuing a second one. `POST /extract` is never retried (the API bills it on arrival).
+
+```python
+WellMarked(api_key="wm_...", max_retries=2)   # 3 attempts total; 0 disables
+```
+
+Pass your own `idempotency_key=` to `bulk()`/`crawl()` to also survive a process crash or your own catch-and-resubmit — same key + same body replays; same key + a different body raises `idempotency_key_reuse`. Records expire after 6 hours.
+
 ## Errors
 
 Every non-2xx response is translated into a typed exception. Catch the base class to handle anything, or the specific subclass to handle one failure mode:
@@ -230,29 +348,29 @@ with WellMarked() as wm:
     except RateLimitError as e:
         print(f"Quota hit. Resets in {e.retry_after}s.")
     except UnprocessableEntityError as e:
-        # e.code is one of: no_content, target_timeout, ...
+        # e.code is one of: no_content, target_timeout, target_http_error, ...
         print(f"Extraction failed ({e.code}): {e.message}")
 ```
 
 | Exception                  | HTTP | Typical `code` values                                                        |
 |----------------------------|------|------------------------------------------------------------------------------|
 | `AuthenticationError`      | 401  | `missing_api_key`, `invalid_api_key`                                         |
-| `PermissionDeniedError`    | 403  | `account_inactive`, `plan_not_supported`, `forbidden`                        |
-| `NotFoundError`            | 404  | `job_not_found`                                                              |
-| `UnprocessableEntityError` | 422  | `no_content`, `target_timeout`, `bulk_cap_exceeded`, `crawl_depth_exceeded`                          |
-| `RateLimitError`           | 429  | `rate_limit_too_fast` *(per-second cap; `retry_after_ms` carries the sub-second back-off)* · `rate_limit_exceeded` *(monthly quota; `retry_after` in seconds)* |
-| `InternalServerError`      | 5xx  | —                                                                            |
+| `PermissionDeniedError`    | 403  | `account_inactive`, `plan_not_supported`, `insufficient_scope`, `forbidden`, `domain_not_allowed`, `domain_denied`, `robots_disallowed` |
+| `NotFoundError`            | 404  | `job_not_found`, `key_not_found`                                             |
+| `UnprocessableEntityError` | 422  | `no_content`, `target_timeout`, `target_http_error`, `unsafe_url`, `bulk_cap_exceeded`, `crawl_depth_exceeded`, `idempotency_key_reuse` |
+| `RateLimitError`           | 429  | `rate_limit_too_fast` *(per-second cap; `retry_after_ms` carries the sub-second back-off)* · `rate_limit_exceeded` *(monthly quota; `retry_after` in seconds)* · `register_rate_limited` |
+| `InternalServerError`      | 5xx  | `service_unavailable` *(retryable)*                                          |
 | `APIConnectionError`       | —    | DNS / TCP / TLS / timeout failures, raised before any HTTP round-trip        |
 
-All inherit from `WellMarkedError`.
+`APIStatusError` is the shared base of every HTTP-status error above; all inherit from `WellMarkedError`.
 
 ## Configuration
 
 ```python
 WellMarked(
     api_key="wm_...",                   # or set WELLMARKED_API_KEY
-    timeout=30.0,                       # seconds, per request
-    max_retries=2,                      # retries for safely replayable requests
+    timeout=30.0,                       # seconds, per attempt
+    max_retries=2,                      # transport retries for safely replayable requests
     headers={"X-Trace-Id": "..."},      # optional: extra headers on every request
 )
 ```
