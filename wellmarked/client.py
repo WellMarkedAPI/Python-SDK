@@ -333,14 +333,28 @@ class WellMarked:
         )
         return BulkJob.from_response(body)
 
-    def get_job(self, job_id: str) -> Union[BulkJob, CrawlJob]:
-        """Polymorphic job lookup — works for both bulk and crawl jobs.
+    @staticmethod
+    def _job_from_body(body: dict[str, Any]) -> Union[BulkJob, CrawlJob]:
+        """Build the right job type from a ``/jobs/{id}`` body, using ``kind``."""
+        if body.get("kind") == "crawl":
+            return CrawlJob.from_response(body)
+        return BulkJob.from_response(body)
 
-        Calls ``GET /bulk/{job_id}`` first, then inspects the response's
-        ``kind`` discriminator field. If the job is actually a crawl, a
-        second request to ``GET /crawl/{job_id}`` fetches the full crawl
-        shape (with per-item depth and the truncated flags). Returns
+    def get_job(self, job_id: str) -> Union[BulkJob, CrawlJob]:
+        """Polymorphic job lookup — works for both bulk and crawl jobs, in
+        ONE call.
+
+        ``GET /jobs/{job_id}`` resolves either kind and returns the superset
+        shape; the ``kind`` discriminator says which you got. Returns
         :class:`BulkJob` or :class:`CrawlJob` accordingly.
+
+        This used to call ``GET /bulk/{job_id}`` purely to read ``kind``,
+        then re-fetch ``GET /crawl/{job_id}`` for the fields the bulk shape
+        omits (``truncated``, ``truncated_reason``, per-item ``depth``).
+        That cost two round trips per crawl poll, and — because ``/bulk/*``
+        requires the ``bulk`` scope — a key scoped to ``crawl`` alone got a
+        403 on the discovery call and could never poll its own job.
+        ``/jobs/{id}`` requires neither scope.
 
         Use ``isinstance(job, CrawlJob)`` or ``job.kind == "crawl"`` to
         branch on crawl-specific behavior. The shared interface
@@ -349,16 +363,7 @@ class WellMarked:
 
         Jobs are retained for 6 hours after completion.
         """
-        body = self._request("GET", f"/bulk/{job_id}")
-        # /bulk/{id} answers for any job_id today (the endpoint just
-        # serializes results in the bulk shape regardless of stored
-        # job_type — see api/routes/bulk.py). The `kind` field tells
-        # us whether we got a bulk-shaped response of a crawl job; if
-        # so, re-fetch via /crawl/{id} for the proper shape.
-        if body.get("kind") == "crawl":
-            body = self._request("GET", f"/crawl/{job_id}")
-            return CrawlJob.from_response(body)
-        return BulkJob.from_response(body)
+        return self._job_from_body(self._request("GET", f"/jobs/{job_id}"))
 
     def wait_for_job(
         self,
@@ -370,9 +375,9 @@ class WellMarked:
         """Block until a job reaches ``status="done"`` (or timeout). Works
         for both bulk and crawl jobs.
 
-        The first call uses the polymorphic :meth:`get_job` to discover
-        the job's kind. Subsequent polls go directly to the typed
-        endpoint, so a crawl job only pays the dispatch round-trip once.
+        Every poll goes to ``/jobs/{id}``, which answers for either kind, so
+        there is no dispatch round-trip to pay and no scope to guess — the
+        loop reads ``kind`` off each body.
 
         Args:
             job_id: The job id returned from :meth:`bulk` or :meth:`crawl`.
@@ -383,9 +388,7 @@ class WellMarked:
             TimeoutError: The job didn't finish before ``timeout`` elapsed.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        # First call: figure out which endpoint owns this job.
         job: Union[BulkJob, CrawlJob] = self.get_job(job_id)
-        is_crawl = isinstance(job, CrawlJob)
         while not job.done:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -393,11 +396,7 @@ class WellMarked:
                     f"(last status: {job.status}, {job.completed}/{job.total})"
                 )
             time.sleep(poll_interval)
-            # Subsequent polls hit the typed endpoint directly — skips the
-            # /bulk + /crawl dispatch get_job does for crawl jobs.
-            path = f"/crawl/{job_id}" if is_crawl else f"/bulk/{job_id}"
-            body = self._request("GET", path)
-            job = CrawlJob.from_response(body) if is_crawl else BulkJob.from_response(body)
+            job = self._job_from_body(self._request("GET", f"/jobs/{job_id}"))
         return job
 
     def crawl(
