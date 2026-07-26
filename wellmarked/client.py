@@ -334,7 +334,7 @@ class WellMarked:
         return BulkJob.from_response(body)
 
     @staticmethod
-    def _job_from_body(body: dict) -> Union[BulkJob, CrawlJob]:
+    def _job_from_body(body: dict[str, Any]) -> Union[BulkJob, CrawlJob]:
         """Build the right job type from a ``/jobs/{id}`` body, using ``kind``."""
         if body.get("kind") == "crawl":
             return CrawlJob.from_response(body)
