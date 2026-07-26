@@ -275,7 +275,7 @@ async def test_async_extract_success() -> None:
 @respx.mock
 async def test_async_wait_for_job_polls_until_done() -> None:
     job_id = "1c4f9a02-0000-0000-0000-000000000000"
-    route = respx.get(f"{BASE_URL}/bulk/{job_id}")
+    route = respx.get(f"{BASE_URL}/jobs/{job_id}")
     route.side_effect = [
         httpx.Response(
             200,
@@ -485,22 +485,10 @@ def test_crawl_negative_depth_validates_client_side() -> None:
 @respx.mock
 def test_get_job_surfaces_crawl_truncation_fields() -> None:
     """Regression: CrawlJob parses every truncation-related field correctly
-    when reached through the polymorphic get_job path. /bulk reports the
-    job's kind as crawl; the SDK re-fetches /crawl for the full shape."""
+    when reached through the polymorphic get_job path — now from the single
+    /jobs/{id} response rather than a /crawl re-fetch."""
     job_id = "9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-    respx.get(f"{BASE_URL}/bulk/{job_id}").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "job_id": job_id, "kind": "crawl",
-                "status": "done", "total": 1000, "completed": 1000,
-                "results": [],
-                "created_at": "2026-05-15T10:00:00+00:00",
-                "finished_at": "2026-05-15T10:02:30+00:00",
-            },
-        )
-    )
-    respx.get(f"{BASE_URL}/crawl/{job_id}").mock(
+    respx.get(f"{BASE_URL}/jobs/{job_id}").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -555,7 +543,7 @@ def test_get_job_surfaces_crawl_truncation_fields() -> None:
 def test_get_job_returns_bulk_job_when_kind_is_bulk() -> None:
     """A response with kind='bulk' (or no kind) → BulkJob, single round-trip."""
     job_id = "1c4f9a02-0000-0000-0000-000000000000"
-    respx.get(f"{BASE_URL}/bulk/{job_id}").mock(
+    respx.get(f"{BASE_URL}/jobs/{job_id}").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -579,25 +567,13 @@ def test_get_job_returns_bulk_job_when_kind_is_bulk() -> None:
 
 
 @respx.mock
-def test_get_job_redispatches_to_crawl_when_kind_is_crawl() -> None:
-    """When /bulk reports kind='crawl', the SDK re-fetches /crawl for the
-    proper shape (with depths + truncated fields) and returns a CrawlJob."""
+def test_get_job_returns_full_crawl_job_in_one_call() -> None:
+    """The regression that matters. get_job used to hit /bulk/{id} just to
+    read `kind`, then re-fetch /crawl/{id} for truncated + depth — two round
+    trips, and a 403 for any key holding `crawl` but not `bulk`, since
+    /bulk/* is scope-gated. One call to /jobs/{id} now carries everything."""
     job_id = "9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-    # First call: /bulk/{id} reports the job IS a crawl.
-    respx.get(f"{BASE_URL}/bulk/{job_id}").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "job_id": job_id, "kind": "crawl",
-                "status": "done", "total": 1, "completed": 1,
-                "results": [],
-                "created_at": "2026-05-15T10:00:00+00:00",
-                "finished_at": "2026-05-15T10:00:30+00:00",
-            },
-        )
-    )
-    # Second call: /crawl/{id} returns the proper crawl shape.
-    respx.get(f"{BASE_URL}/crawl/{job_id}").mock(
+    respx.get(f"{BASE_URL}/jobs/{job_id}").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -622,31 +598,22 @@ def test_get_job_redispatches_to_crawl_when_kind_is_crawl() -> None:
     assert job.truncated
     assert job.truncated_reason == "page_cap_reached"
     assert job.results[0].depth == 0
+    assert respx.calls.call_count == 1
+    # The scope-gated poll routes must not be touched: /bulk/* needs `bulk`
+    # and /crawl/* needs `crawl`, which is the 403 this endpoint removes.
+    assert respx.calls[0].request.url.path == f"/jobs/{job_id}"
 
 
 @respx.mock
-def test_wait_for_job_uses_typed_endpoint_after_first_call() -> None:
-    """wait_for_job's first call goes through get_job (polymorphic). After it
-    detects the kind, subsequent polls hit the typed endpoint directly — so
-    a crawl job's polling loop doesn't re-pay the /bulk + /crawl dispatch
-    on every iteration."""
+def test_wait_for_job_polls_crawl_jobs_with_no_dispatch_round_trip() -> None:
+    """Every poll goes to /jobs/{id}, which answers for either kind. The old
+    loop spent three calls to reach the same result on a crawl job: a /bulk
+    discovery, a /crawl re-fetch, then the real poll."""
     job_id = "9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
-    # Discovery call: /bulk says crawl, /crawl returns processing.
-    respx.get(f"{BASE_URL}/bulk/{job_id}").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "job_id": job_id, "kind": "crawl",
-                "status": "processing", "total": 2, "completed": 1,
-                "results": [],
-                "created_at": "2026-05-15T10:00:00+00:00",
-            },
-        )
-    )
-    crawl_route = respx.get(f"{BASE_URL}/crawl/{job_id}")
-    crawl_route.side_effect = [
-        # First /crawl call: completes the discovery (after /bulk re-dispatch).
+    jobs_route = respx.get(f"{BASE_URL}/jobs/{job_id}")
+    jobs_route.side_effect = [
+        # First call — still processing.
         httpx.Response(
             200,
             json={
@@ -657,7 +624,7 @@ def test_wait_for_job_uses_typed_endpoint_after_first_call() -> None:
                 "created_at": "2026-05-15T10:00:00+00:00",
             },
         ),
-        # Second /crawl call: poll iteration after the sleep — should be DONE.
+        # Second call — poll iteration after the sleep, now DONE.
         httpx.Response(
             200,
             json={
@@ -679,10 +646,8 @@ def test_wait_for_job_uses_typed_endpoint_after_first_call() -> None:
 
     assert isinstance(job, CrawlJob)
     assert job.done
-    # /bulk called exactly once (discovery), /crawl called twice (one for
-    # discovery re-fetch, one for the actual poll iteration). If we'd
-    # routed every poll through get_job we'd see /bulk hit a 2nd time.
-    assert respx.calls.call_count == 3
+    assert respx.calls.call_count == 2
+    assert {c.request.url.path for c in respx.calls} == {f"/jobs/{job_id}"}
 
 
 @pytest.mark.asyncio
@@ -693,19 +658,7 @@ async def test_async_wait_for_job_handles_crawl_jobs() -> None:
     crawl-specific function."""
     job_id = "9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
-    respx.get(f"{BASE_URL}/bulk/{job_id}").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "job_id": job_id, "kind": "crawl",
-                "status": "done", "total": 1, "completed": 1,
-                "results": [],
-                "created_at": "2026-05-15T10:00:00+00:00",
-                "finished_at": "2026-05-15T10:00:30+00:00",
-            },
-        )
-    )
-    respx.get(f"{BASE_URL}/crawl/{job_id}").mock(
+    respx.get(f"{BASE_URL}/jobs/{job_id}").mock(
         return_value=httpx.Response(
             200,
             json={

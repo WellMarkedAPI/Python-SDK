@@ -178,17 +178,21 @@ class AsyncWellMarked:
         )
         return BulkJob.from_response(body)
 
-    async def get_job(self, job_id: str) -> Union[BulkJob, CrawlJob]:
-        """Polymorphic job lookup — works for both bulk and crawl jobs.
-
-        See :meth:`wellmarked.WellMarked.get_job` for the full
-        explanation of the kind-discriminator + optional re-fetch model.
-        """
-        body = await self._request("GET", f"/bulk/{job_id}")
+    @staticmethod
+    def _job_from_body(body: dict) -> Union[BulkJob, CrawlJob]:
+        """Build the right job type from a ``/jobs/{id}`` body, using ``kind``."""
         if body.get("kind") == "crawl":
-            body = await self._request("GET", f"/crawl/{job_id}")
             return CrawlJob.from_response(body)
         return BulkJob.from_response(body)
+
+    async def get_job(self, job_id: str) -> Union[BulkJob, CrawlJob]:
+        """Polymorphic job lookup — works for both bulk and crawl jobs, in
+        ONE call to ``GET /jobs/{job_id}``.
+
+        See :meth:`wellmarked.WellMarked.get_job` for why this replaced the
+        old ``/bulk`` discovery call plus ``/crawl`` re-fetch.
+        """
+        return self._job_from_body(await self._request("GET", f"/jobs/{job_id}"))
 
     async def wait_for_job(
         self,
@@ -198,11 +202,10 @@ class AsyncWellMarked:
         timeout: Optional[float] = 300.0,
     ) -> Union[BulkJob, CrawlJob]:
         """Await until a job reaches ``status="done"`` (or timeout). Works
-        for both bulk and crawl jobs — same polymorphic dispatch as the
-        sync client. See :meth:`wellmarked.WellMarked.wait_for_job`."""
+        for both bulk and crawl jobs — same single-call polling as the sync
+        client. See :meth:`wellmarked.WellMarked.wait_for_job`."""
         deadline = None if timeout is None else time.monotonic() + timeout
         job: Union[BulkJob, CrawlJob] = await self.get_job(job_id)
-        is_crawl = isinstance(job, CrawlJob)
         while not job.done:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -210,11 +213,7 @@ class AsyncWellMarked:
                     f"(last status: {job.status}, {job.completed}/{job.total})"
                 )
             await asyncio.sleep(poll_interval)
-            # Subsequent polls hit the typed endpoint directly — skips the
-            # /bulk + /crawl dispatch get_job does for crawl jobs.
-            path = f"/crawl/{job_id}" if is_crawl else f"/bulk/{job_id}"
-            body = await self._request("GET", path)
-            job = CrawlJob.from_response(body) if is_crawl else BulkJob.from_response(body)
+            job = self._job_from_body(await self._request("GET", f"/jobs/{job_id}"))
         return job
 
     async def crawl(

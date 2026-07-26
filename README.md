@@ -120,6 +120,8 @@ for item in job.results:
 
 `get_job` and `wait_for_job` are **polymorphic** — they work for both bulk and crawl `job_id`s. The SDK reads a `kind` discriminator from the API response and returns either a `BulkJob` or a `CrawlJob`. Use `isinstance(job, CrawlJob)` (or check `job.kind == "crawl"`) before reading crawl-specific fields like `job.truncated` or `item.depth`.
 
+Both resolve a job in a **single request** to `GET /jobs/{id}`, which answers for either kind and requires neither the `bulk` nor the `crawl` scope. Earlier versions polled `/bulk/{id}` first just to read `kind`, then re-fetched `/crawl/{id}` for the crawl-only fields — so a key scoped to `crawl` alone got a `403` and could not poll its own job. Requires an API deployed on or after this endpoint's release.
+
 Bulk submissions carry an automatically generated `Idempotency-Key` (see [Retries & idempotency](#retries--idempotency)), so an internal retry replays the original job rather than enqueuing a second one.
 
 ## Crawl
