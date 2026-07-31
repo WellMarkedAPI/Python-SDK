@@ -9,6 +9,8 @@ Official Python SDK for the **[WellMarked](https://wellmarked.io)** API — conv
 pip install wellmarked
 ```
 
+📖 **[SDK documentation](https://wellmarked.io/docs/sdks/python)** · [API reference](https://wellmarked.io/docs/api/extraction/extract) · [Errors](https://wellmarked.io/docs/guides/errors)
+
 ## Quick start
 
 ```python
@@ -275,7 +277,7 @@ Pass `webhook_include_results=True` on submission to inline the full `results` a
 * `X-WellMarked-Delivery-Id` is stable across retries — use it as your idempotency key. `X-WellMarked-Timestamp` and `X-WellMarked-Signature` are recomputed every attempt.
 * Treat delivery as **at-least-once**.
 
-See the [Webhooks documentation](https://wellmarked.io/docs#webhooks) for the full signature scheme and header reference.
+See the [Webhooks documentation](https://wellmarked.io/docs/guides/webhooks) for the full signature scheme and header reference.
 
 ## Custom headers
 
